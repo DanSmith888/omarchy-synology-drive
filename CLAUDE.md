@@ -73,5 +73,12 @@ bin/syndctl doctor
   `busctl --user get-property org.kde.StatusNotifierItem-<pid>-1 /StatusNotifierItem org.kde.StatusNotifierItem ToolTip`
   → `"Synology Drive Client 4.0.3\nUp-to-date"`. Not used yet (needs the
   UI pid); a good cross-check for `doctor`.
+- Shell IPC arity: `omarchy-shell shell toggle <id> '{}'` and
+  `summon <id> '{}'`, but `hide <id>` takes only the id and there is no
+  `show`; wrong arity prints the function signature and does nothing.
+- `omarchy plugin remove <id>` needs `--yes` when stdin is not a TTY.
+- Checklist pass 2026-09-01: click/Esc/summon/hide/toggle, reopen after
+  close, border vs `omarchy.tailscale`, disable→enable→restart,
+  remove→zero residue→reinstall — all verified by screenshot.
 - Screenshot geometry: `grim -g` takes logical px; the display is 5120×2160
   at scale 1.25. The panel opens at roughly `3286,28 412x572`.
