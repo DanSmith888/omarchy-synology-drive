@@ -1,7 +1,5 @@
 import QtQuick
-import Quickshell
 import Quickshell.Io
-import qs.Commons
 import qs.Ui
 
 // Synology Drive: the pill in the bar, and the host for the panel.
@@ -19,7 +17,24 @@ BarWidget {
 
   // Mirrors of the panel's state, so the pill has nothing to compute.
   readonly property bool devicePresent: panel ? panel.devicePresent === true : false
-  readonly property string label: panel ? panel.label : ""
+  readonly property string syncState: panel ? panel.syncState : ""
+  readonly property int pending: panel ? panel.pending : 0
+  readonly property var current: panel ? panel.current : null
+
+  // While a transfer runs the glyph alternates between "cloud-sync" and the
+  // direction of the current file, so the pill visibly moves without a
+  // spinner — and the count says how much is left.
+  property bool phase: false
+  Timer {
+    interval: 700
+    running: root.visible && root.syncState === "syncing"
+    repeat: true
+    onTriggered: root.phase = !root.phase
+    onRunningChanged: if (!running) root.phase = false
+  }
+
+  // Setting: a pill that only appears when something is happening.
+  readonly property bool hideWhenIdle: root.settings && root.settings.hideWhenIdle === true
 
   // ---- Panel lifecycle contract (shell.summon/hide/toggle routing).
   readonly property bool opened: panel ? panel.opened === true : false
@@ -40,9 +55,10 @@ BarWidget {
     if ("hostWidget" in target) target.hostWidget = root
   }
 
-  // Hidden, not removed, when there is nothing to show: the slot stays in
-  // shell.json and the pill reappears on its own.
-  visible: root.devicePresent
+  // Hidden, not removed, when the client is not installed (or, by setting,
+  // while idle): the slot stays in shell.json and the pill reappears on its
+  // own.
+  visible: root.devicePresent && !(root.hideWhenIdle && root.syncState === "uptodate" && !root.opened)
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -71,6 +87,7 @@ BarWidget {
     function hide(): void { root.close() }
     function toggle(): void { root.togglePanel() }
     function refresh(): void { root.broadcast("refresh") }
+    function state(): string { return root.syncState }
   }
 
   // WidgetButton, not BarIconButton: the latter is glyph-only and clips text.
@@ -78,14 +95,36 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.label !== "" ? "󰋼  " + root.label : "󰋼"   // TODO: glyph + text
+    // Glyph alone when everything is fine; a word or a count only when there
+    // is something to know. That is the whole point versus the old tray icon.
+    text: {
+      if (!root.panel) return ""
+      var g = root.panel.stateGlyph(root.syncState)
+      switch (root.syncState) {
+      case "syncing":
+        if (root.phase && root.current) g = root.panel.directionGlyph(root.current.direction)
+        return g + "  " + root.pending
+      case "paused":   return g + "  Paused"
+      case "offline":  return g + "  Offline"
+      case "error":    return g + "  Error"
+      default:         return g
+      }
+    }
     hasVisualContent: text !== ""
     horizontalMargin: 8.75
     verticalPadding: 8.75
-    tooltipText: root.label !== "" ? "Synology Drive — " + root.label : "Synology Drive"
+    active: root.syncState === "error"
+    tooltipText: {
+      if (!root.panel) return "Synology Drive"
+      var t = "Synology Drive — " + root.panel.stateText(root.syncState)
+      if (root.current) t += "\n" + (root.current.direction === "download" ? "↓ " : "↑ ") + root.current.name
+      if (root.panel.stale) t += " (last known)"
+      return t
+    }
 
     onPressed: function(b) {
       if (b === Qt.MiddleButton) root.refresh()
+      else if (b === Qt.RightButton) { if (root.panel) root.panel.showClient() }
       else root.togglePanel()
     }
   }

@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""syndstatus — one JSON line describing the Synology Drive Client's state.
+
+    {"present": true, "state": "syncing", "pending": 3, "sessions": [...], ...}
+
+`present` is true whenever the client is installed, even when its daemon is
+stopped — a stopped client is worth a pill, an absent one is not. Exits 0
+with an empty object when the client is not installed so the widget hides
+itself. `state: null` means the client is there but the probe could not
+read it this time; the widget keeps its last reading.
+
+All the work is in bin/syndctl; this only decides whether there is anything
+to show. Standard library only. No root, no network.
+"""
+
+import json
+import os
+import subprocess
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CLIENT_CONF = os.path.expanduser("~/.SynologyDrive/data/config/client.conf")
+TIMEOUT = 10
+
+
+def run(cmd, timeout=TIMEOUT):
+    """stdout on success, None on any failure. Never raises, never hangs."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def main():
+    if not os.path.isfile(CLIENT_CONF):
+        print("{}")
+        return
+
+    state = {"present": True, "state": None}
+    out = run([os.path.join(HERE, "syndctl"), "get", "--json"])
+    if out:
+        try:
+            d = json.loads(out)
+            if isinstance(d, dict):
+                state.update(d)
+        except json.JSONDecodeError:
+            pass
+    print(json.dumps(state))
+
+
+if __name__ == "__main__":
+    main()

@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "author": "Daniel Smith",
   "license": "MIT",
-  "description": "Synology Drive Client sync status and controls in the bar",
+  "description": "Synology Drive Client status in the bar: what's syncing, what failed, pause/resume — without the Qt tray icon.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,9 +14,29 @@
   },
   "barWidget": {
     "displayName": "Synology Drive",
-    "description": "Synology Drive Client sync status and controls in the bar",
+    "description": "Synology Drive Client status in the bar: what's syncing, what failed, pause/resume — without the Qt tray icon.",
     "category": "System",
     "allowMultiple": false,
-    "defaultSection": "right"
+    "defaultSection": "right",
+    "defaults": {
+      "hideWhenIdle": false,
+      "logCount": 40
+    },
+    "schema": [
+      {
+        "key": "hideWhenIdle",
+        "type": "boolean",
+        "label": "Hide the pill while everything is up to date"
+      },
+      {
+        "key": "logCount",
+        "type": "integer",
+        "label": "Log entries to keep in the panel",
+        "min": 5,
+        "max": 100,
+        "step": 5,
+        "defaultValue": 40
+      }
+    ]
   }
 }

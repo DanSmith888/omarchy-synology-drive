@@ -1,0 +1,1002 @@
+#!/usr/bin/env python3
+"""syndctl — command-line backend for the Synology Drive Omarchy plugin.
+
+Reads the state the Synology Drive Client already keeps on disk — its SQLite
+databases and daemon log under ~/.SynologyDrive — and drives the running
+client through its own single-instance command channel (`synology-drive
+pause|resume|show`). It never talks to the NAS and never writes to the
+client's files.
+
+Usage:
+  syndctl get [--json]              connection, sync folders, activity, state
+  syndctl log [-n N] [--json]       sync history, newest first (the client's Logs page)
+  syndctl unsynced [--json]         files the client refused to sync
+  syndctl settings [--json]         the client's options, read-only
+  syndctl show                      raise the client's own window
+  syndctl open [<session-id>]       open a sync folder in the file manager
+  syndctl reveal <path>             select a file in the file manager
+  syndctl doctor                    check every link from the client to the bar
+
+pause/resume are deliberately absent: the client's `synology-drive pause`
+verb turned out to rewrite a per-task setting (sync_mode) rather than pause,
+and there is no other documented control path yet. See README "Good to know".
+"""
+
+import argparse
+import fcntl
+import glob
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+
+PLUGIN_ID = "dansmith888.synology-drive"
+REPO_URL = "https://github.com/DanSmith888/omarchy-synology-drive.git"
+REQUIRED_FILES = ("manifest.json", "BarWidget.qml", "Panel.qml",
+                  "bin/syndstatus", "bin/syndctl")
+
+# Never /tmp: a predictable shared path could be pre-created by another user.
+_RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+LOCK_PATH = os.path.join(_RUNTIME_DIR, "syndctl.lock")
+LOCK_TIMEOUT = 30.0
+TIMEOUT = 10
+
+DRIVE_DIR = os.path.expanduser("~/.SynologyDrive")
+CLIENT_CONF = os.path.join(DRIVE_DIR, "data", "config", "client.conf")
+LAUNCHER = "synology-drive"
+
+# How much of the daemon log one poll reads. The log rotates at 5 MB and is
+# dominated by rescan chatter; 1 MB is ~13k lines, minutes to hours of
+# activity, and parses in a few milliseconds.
+LOG_TAIL_BYTES = 1_000_000
+
+# history_table.action codes, mapped from observed rows (the binary keeps no
+# names for them). Anything else is shown as "changed".
+HISTORY_ACTION = {
+    40: "downloaded",   # server -> local add/update
+    24: "uploaded",     # local change pushed to the NAS
+    34: "skipped",      # file excluded by the client's filter
+    17: "skipped",      # directory excluded by the client's filter
+}
+
+# history_table.not_synced_reason. -8192 is the only code seen so far and it
+# lines up exactly with the blacklist filter (dot-files, *.tmp, *.crdownload
+# style temporaries), so it is "excluded", not an error.
+UNSYNCED_REASON = {
+    -8192: "excluded by filter",
+}
+FILTERED_REASONS = {-8192}
+
+
+def _run(cmd, timeout=TIMEOUT, env=None):
+    """(rc, stdout, stderr); rc -1 on timeout/missing binary. Never raises."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, env=env)
+        return r.returncode, r.stdout, r.stderr
+    except Exception as exc:
+        return -1, "", str(exc)
+
+
+# ---------------------------------------------------------------------------
+# Where the client keeps things
+
+def read_conf():
+    """client.conf as a dict. Empty when the client is not installed."""
+    conf = {}
+    try:
+        with open(CLIENT_CONF) as f:
+            for line in f:
+                if "=" not in line:
+                    continue
+                k, v = line.rstrip("\n").split("=", 1)
+                conf[k.strip()] = v.strip().strip('"')
+    except OSError:
+        pass
+    return conf
+
+
+def installed():
+    return os.path.isfile(CLIENT_CONF)
+
+
+def _proc_running(needle):
+    """PID of the first process whose cmdline contains `needle`, else None.
+
+    A /proc scan rather than pgrep: no subprocess, and it works the same
+    inside the shell's Process as from a terminal.
+    """
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\0", b" ")
+        except OSError:
+            continue
+        if needle.encode() in cmd:
+            return int(pid)
+    return None
+
+
+def daemon_pid(conf):
+    """PID from the daemon's pid file if that process is still the daemon."""
+    pid_file = conf.get("pid_file_path") or os.path.join(DRIVE_DIR, "daemon.pid")
+    try:
+        with open(pid_file) as f:
+            pid = int(f.read().strip() or 0)
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            if b"cloud-drive-daemon" in f.read():
+                return pid
+    except (OSError, ValueError):
+        pass
+    return _proc_running("cloud-drive-daemon")
+
+
+def client_version():
+    """'4.0.3-17892' from the app bundle's INFO file, else None."""
+    parts = {}
+    try:
+        with open(os.path.join(DRIVE_DIR, "SynologyDrive.app", "INFO")) as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    parts[k.strip()] = v.strip().strip('"')
+    except OSError:
+        return None
+    try:
+        ver = ".".join(parts[k] for k in ("major_version", "minor_version", "mini_version"))
+    except KeyError:
+        return None
+    return f"{ver}-{parts['build_version']}" if parts.get("build_version") else ver
+
+
+# ---------------------------------------------------------------------------
+# SQLite: connection + sync folders (sys.sqlite), history (history.sqlite)
+
+def _db(path):
+    """Read-only connection, or None. mode=ro keeps sqlite from ever writing
+    to the client's database; the -shm/-wal files are ours to read."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA query_only = 1")
+        return con
+    except sqlite3.Error:
+        return None
+
+
+def _sys_db(conf):
+    return _db(os.path.join(conf.get("db_path") or os.path.join(DRIVE_DIR, "data", "db"),
+                            "sys.sqlite"))
+
+
+def _history_db(conf):
+    return _db(conf.get("history_db_path")
+               or os.path.join(DRIVE_DIR, "data", "db", "history.sqlite"))
+
+
+def connection(conf):
+    """The linked NAS, or None when the client has never been linked."""
+    con = _sys_db(conf)
+    if con is None:
+        return None
+    try:
+        row = con.execute(
+            "select id, server_name, server_ip, server_port, username, "
+            "computer_name, use_ssl, linked, status, error, host_name, "
+            "conn_type, major, minor, package_version "
+            "from connection_table order by linked desc, id limit 1").fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    if row is None:
+        return None
+    server = row["server_name"] or row["server_ip"] or ""
+    host = row["host_name"] or server.split(".")[0]
+    return {
+        "id": row["id"],
+        "server": server,
+        "host": host,
+        "ip": row["server_ip"] or None,
+        "port": row["server_port"],
+        "user": row["username"],
+        "computer": row["computer_name"],
+        "ssl": bool(row["use_ssl"]),
+        "linked": bool(row["linked"]),
+        "status": row["status"],
+        "error": row["error"],
+        "server_version": (f"{row['major']}.{row['minor']}"
+                           if row["major"] else None),
+    }
+
+
+def sessions(conf):
+    """Sync folders ("sessions" in Synology's terms), oldest first."""
+    con = _sys_db(conf)
+    if con is None:
+        return []
+    try:
+        rows = con.execute(
+            "select id, conn_id, share_name, remote_path, sync_folder, status, "
+            "error, sync_direction, is_read_only, is_daemon_enable, "
+            "session_type, custom_session_name, is_shared_with_me "
+            "from session_table order by id").fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+    out = []
+    for r in rows:
+        folder = (r["sync_folder"] or "").rstrip("/")
+        out.append({
+            "id": r["id"],
+            "name": r["custom_session_name"] or r["share_name"] or os.path.basename(folder),
+            "share": r["share_name"],
+            "remote": r["remote_path"] or "/",
+            "folder": folder,
+            "status": r["status"],
+            "error": r["error"],
+            # 0 = two-way, 1 = download only, 2 = upload only (client UI order)
+            "direction": r["sync_direction"],
+            "read_only": bool(r["is_read_only"]),
+            "enabled": bool(r["is_daemon_enable"]),
+            "type": r["session_type"],
+            "shared_with_me": bool(r["is_shared_with_me"]),
+        })
+    return out
+
+
+def _history_row(r):
+    action = HISTORY_ACTION.get(r["action"], "changed")
+    path = r["path"] or ""
+    return {
+        "exists": bool(path) and os.path.lexists(path),
+        "id": r["id"],
+        "session": r["session_id"],
+        "action": action,
+        "action_code": r["action"],
+        "time": r["update_time"],
+        "is_dir": bool(r["is_dir"]),
+        "name": r["name"],
+        "path": r["path"],
+        "folder": (r["sync_folder"] or "").rstrip("/"),
+    }
+
+
+def recent(conf, limit=8, offset=0):
+    """Most recent completed transfers, newest first. Skipped files are left
+    out: they are what `unsynced` is for."""
+    con = _history_db(conf)
+    if con is None:
+        return []
+    try:
+        rows = con.execute(
+            "select id, session_id, action, update_time, is_dir, name, path, "
+            "sync_folder from history_table where is_not_synced = 0 "
+            "order by id desc limit ? offset ?", (limit, offset)).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+    return [_history_row(r) for r in rows]
+
+
+def unsynced(conf, limit=8):
+    """(problems, skipped_count): files the client would not sync.
+
+    Entries excluded by the client's own filter (temporaries, dot-files) are
+    only counted; the rest — the ones the Synology tray raises alerts for —
+    come back as rows, newest first, one per path.
+    """
+    con = _history_db(conf)
+    if con is None:
+        return [], 0
+    try:
+        skipped = con.execute(
+            "select count(distinct path) from history_table "
+            "where is_not_synced = 1 and not_synced_reason in (%s)"
+            % ",".join(str(x) for x in FILTERED_REASONS)).fetchone()[0]
+        rows = con.execute(
+            "select max(id) id, session_id, action, max(update_time) update_time, "
+            "is_dir, name, path, sync_folder, not_synced_reason "
+            "from history_table where is_not_synced = 1 "
+            "and not_synced_reason not in (%s) "
+            "group by path order by id desc limit ?"
+            % ",".join(str(x) for x in FILTERED_REASONS), (limit,)).fetchall()
+    except sqlite3.Error:
+        return [], 0
+    finally:
+        con.close()
+    out = []
+    for r in rows:
+        d = _history_row(r)
+        code = r["not_synced_reason"]
+        d["reason_code"] = code
+        d["reason"] = UNSYNCED_REASON.get(code, f"not synced (code {code})")
+        out.append(d)
+    return out, skipped
+
+
+def _filter_file(path):
+    """A Synology .filter file (INI-ish) as {section: {key: [values]}}."""
+    out, section = {}, None
+    try:
+        with open(path) as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    section = line[1:-1]
+                    out.setdefault(section, {})
+                elif "=" in line and section is not None:
+                    k, v = line.split("=", 1)
+                    vals = [x.strip().strip('"') for x in v.split(",")]
+                    out[section][k.strip()] = [x for x in vals if x != ""]
+    except OSError:
+        return None
+    return out
+
+
+def settings(conf):
+    """What the client's own Settings pages show, read-only.
+
+    Global flags come from system_table, per-task options from session_table
+    and the task's filter files. Nothing here can be written back: the only
+    supported way to change them is the client's own window (`syndctl show`).
+    """
+    con = _sys_db(conf)
+    glob = {}
+    if con is not None:
+        try:
+            glob = {r["key"]: r["value"] for r in con.execute("select key, value from system_table")}
+        except sqlite3.Error:
+            glob = {}
+        finally:
+            con.close()
+
+    def flag(k):
+        v = glob.get(k)
+        return None if v is None else v not in ("0", "", "false")
+
+    tasks = []
+    for s in sessions(conf):
+        sdir = os.path.join(DRIVE_DIR, "data", "session", str(s["id"]), "conf")
+        black = _filter_file(os.path.join(sdir, "blacklist.filter")) or {}
+        common, files = black.get("Common", {}), black.get("File", {})
+        tasks.append({
+            "id": s["id"], "name": s["name"], "folder": s["folder"], "remote": s["remote"],
+            "direction": {0: "two-way", 1: "download only", 2: "upload only"}.get(s["direction"], str(s["direction"])),
+            "read_only": s["read_only"],
+            "enabled": s["enabled"],
+            "filters": {
+                "excluded_extensions": files.get("black_ext", []),
+                "excluded_name_prefixes": common.get("black_prefix", []),
+                "excluded_folders": common.get("black_dir_prefix", []),
+                "max_file_size": int(files.get("max_size", ["0"])[0] or 0) or None,
+            },
+        })
+
+    return {
+        "global": {
+            "start_at_login": flag("enable_startup"),
+            "desktop_notifications": flag("enable_desktop_notification"),
+            "unsynced_notifications": flag("enable_unsynced_notification"),
+            "icon_overlay": flag("enable_iconoverlay"),
+            "context_menu": flag("enable_context_menu"),
+            "black_white_tray_icon": flag("use_black_white_icon"),
+            "sync_temp_files": flag("sync_temp_file"),
+            "advanced_log": flag("enable_advanced_log"),
+            "sync_mode": glob.get("sync_mode"),
+            "proxy": flag("user_use_proxy"),
+            "computer_name": glob.get("computer_name"),
+        },
+        "tasks": tasks,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Daemon log: the only place live activity shows up
+
+_PREFIX_RE = re.compile(
+    r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d) \(\s*(\d+):\s*\d+\) \[(\w+)\] "
+    r"([\w.-]+)\(\d+\): (.*)$")
+_EVENT_RE = re.compile(
+    r"Event<(\w+)>\[(\d+)\]\{source: (\w+), type: (\w+), file_id: '[^']*', "
+    r"parent_id: '[^']*', path: '(.*?)', sync_id: \d+, max_id: \d+, "
+    r"file_size: (\d+)")
+_POOL_EMPTY_RE = re.compile(
+    r"Syncer event pool is now empty.*session id (\d+)")
+_SET_SYNC_ID_RE = re.compile(r"Set session (\d+)'s sync_id to")
+
+_EVENT_KIND = {
+    "add": "added", "modify": "modified", "remove": "removed",
+    "delete": "removed", "rename": "renamed", "move": "moved",
+}
+
+
+def _log_path(conf):
+    return conf.get("log_file_path") or os.path.join(DRIVE_DIR, "log", "daemon.log")
+
+
+def _tail(path, nbytes):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - nbytes))
+            data = f.read()
+    except OSError:
+        return b""
+    if size > nbytes:
+        data = data.split(b"\n", 1)[-1]      # drop the partial first line
+    return data
+
+
+def log_tail(conf):
+    """The last LOG_TAIL_BYTES of the daemon log as text. When the live file
+    is young (just rotated) the newest rotated file is prepended so the
+    paused/offline markers survive a rotation."""
+    path = _log_path(conf)
+    data = _tail(path, LOG_TAIL_BYTES)
+    if len(data) < LOG_TAIL_BYTES:
+        rotated = sorted(glob.glob(path + "_*"), key=lambda p: os.path.getmtime(p))
+        if rotated:
+            data = _tail(rotated[-1], LOG_TAIL_BYTES - len(data)) + data
+    return data.decode("utf-8", "replace")
+
+
+def _ts(text):
+    try:
+        return int(time.mktime(time.strptime(text, "%Y-%m-%dT%H:%M:%S")))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _event_kind(cls, ftype):
+    name = cls.lower().replace("event", "")
+    for k, v in _EVENT_KIND.items():
+        if name.endswith(k):
+            return v
+    return "changed"
+
+
+def parse_log(text):
+    """Live state from the daemon's own narration.
+
+    PushEvent queues a file, PullEvent hands it to a worker, DoneEvent
+    finishes it, and "Syncer event pool is now empty" for a session means
+    that folder is up to date. pause/resume and channel failures are the
+    only markers for paused and offline. A daemon restart (new pid in the
+    prefix) drops everything queued by the previous one.
+    """
+    pending = {}            # (session, path) -> item
+    idle_at = {}            # session -> ts of last "pool empty"
+    paused = False
+    pause_ts = None
+    last_fail = None        # ts of last "Failed to establish a new channel"
+    last_ok = None          # ts of last sign the NAS answered
+    last_activity = None    # ts of last Push/Done
+    last_error = None
+    last_pid = None
+    last_ts = None
+
+    for line in text.splitlines():
+        # rescan chatter is 85% of the log and never interesting
+        if "rescan-handler.cpp" in line:
+            continue
+        m = _PREFIX_RE.match(line)
+        if not m:
+            continue
+        ts_text, pid, level, src, msg = m.groups()
+        ts = _ts(ts_text)
+        last_ts = ts
+        if pid != last_pid:
+            if last_pid is not None:
+                pending.clear()
+                paused = False
+            last_pid = pid
+
+        if src == "event-manager.cpp":
+            e = _EVENT_RE.search(msg)
+            if not e:
+                continue
+            cls, sess, source, ftype, path, size = e.groups()
+            key = (int(sess), path)
+            if msg.startswith("PushEvent"):
+                pending[key] = {
+                    "session": int(sess), "path": path,
+                    "name": os.path.basename(path.rstrip("/")) or path,
+                    "direction": "download" if source == "server" else "upload",
+                    "kind": _event_kind(cls, ftype), "is_dir": ftype != "file",
+                    "size": int(size), "since": ts, "started": False,
+                }
+                last_activity = ts
+            elif msg.startswith("PullEvent"):
+                item = pending.get(key)
+                if item is None:
+                    item = pending[key] = {
+                        "session": int(sess), "path": path,
+                        "name": os.path.basename(path.rstrip("/")) or path,
+                        "direction": "download" if source == "server" else "upload",
+                        "kind": _event_kind(cls, ftype), "is_dir": ftype != "file",
+                        "size": int(size), "since": ts,
+                    }
+                item["started"] = True
+                item["started_at"] = ts
+            elif msg.startswith("DoneEvent"):
+                pending.pop(key, None)
+                last_activity = ts
+                last_ok = ts
+            continue
+
+        if src == "syncer-event-manager.cpp":
+            e = _POOL_EMPTY_RE.search(msg)
+            if e:
+                sess = int(e.group(1))
+                idle_at[sess] = ts
+                for key in [k for k in pending if k[0] == sess]:
+                    del pending[key]
+                last_ok = ts
+            continue
+
+        if src == "worker_mgr.cpp":
+            if "pause all worker" in msg:
+                paused, pause_ts = True, ts
+            elif "resume all worker" in msg:
+                paused, pause_ts = False, ts
+            continue
+
+        if src == "pullevent-handler.cpp" and _SET_SYNC_ID_RE.search(msg):
+            last_ok = ts
+            continue
+
+        if src == "protocol-client.cpp" and "Failed to establish a new channel" in msg:
+            last_fail = ts
+            continue
+
+        if level == "ERROR":
+            last_error = {"time": ts, "text": msg[:160]}
+
+    offline = last_fail is not None and (last_ok is None or last_fail > last_ok)
+    queue = sorted(pending.values(), key=lambda i: (not i.get("started"), i["since"] or 0))
+    current = None
+    started = [i for i in queue if i.get("started")]
+    if started:
+        current = max(started, key=lambda i: i.get("started_at") or 0)
+    return {
+        "queue": queue,
+        "current": current,
+        "paused": paused,
+        "paused_since": pause_ts if paused else None,
+        "offline": offline,
+        "offline_since": last_fail if offline else None,
+        "idle_at": idle_at,
+        "last_activity": last_activity,
+        "last_error": last_error,
+        "log_last_ts": last_ts,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Putting it together
+
+class Client:
+    """Exclusive access to the client's files and command channel.
+
+    Reads would be safe without it, but every syndctl/syndstatus invocation
+    going through one lock keeps a pause/resume from racing a poll.
+    """
+
+    def __enter__(self):
+        self._lock = open(LOCK_PATH, "w")
+        deadline = time.monotonic() + LOCK_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    self._lock.close()
+                    raise SystemExit(
+                        f"syndctl: busy (waited {LOCK_TIMEOUT:.0f}s for {LOCK_PATH})")
+                time.sleep(0.25)
+        self.conf = read_conf()
+        return self
+
+    def __exit__(self, *_):
+        try:
+            fcntl.flock(self._lock, fcntl.LOCK_UN)
+        finally:
+            self._lock.close()
+
+    # ---- read
+
+    def get(self, recent_n=40, queue_n=8):
+        conf = self.conf
+        if not conf:
+            return None
+        conn = connection(conf)
+        sess = sessions(conf)
+        live = parse_log(log_tail(conf))
+        problems, skipped = unsynced(conf, limit=6)
+        dpid = daemon_pid(conf)
+        upid = _proc_running("cloud-drive-ui")
+
+        # Local events carry file_size 0 in the log; the file is right there.
+        folders = {s["id"]: s["folder"] for s in sess}
+        for item in live["queue"]:
+            if item["direction"] == "upload" and not item["size"] and item["session"] in folders:
+                try:
+                    item["size"] = os.path.getsize(folders[item["session"]] + item["path"])
+                except OSError:
+                    pass
+
+        by_session = {}
+        for item in live["queue"]:
+            by_session.setdefault(item["session"], []).append(item)
+        for s in sess:
+            q = by_session.get(s["id"], [])
+            s["pending"] = len(q)
+            s["idle_since"] = live["idle_at"].get(s["id"])
+            if not dpid:
+                s["state"] = "stopped"
+            elif s["error"]:
+                s["state"] = "error"
+            elif live["paused"]:
+                s["state"] = "paused"
+            elif live["offline"]:
+                s["state"] = "offline"
+            elif q:
+                s["state"] = "syncing"
+            else:
+                s["state"] = "uptodate"
+
+        if not dpid:
+            state = "stopped"
+        elif conn is None or not conn["linked"]:
+            state = "unlinked"
+        elif live["paused"]:
+            state = "paused"
+        elif conn["error"] or any(s["error"] for s in sess):
+            state = "error"
+        elif live["offline"]:
+            state = "offline"
+        elif live["queue"]:
+            state = "syncing"
+        else:
+            state = "uptodate"
+
+        try:
+            log_age = int(time.time() - os.path.getmtime(_log_path(conf)))
+        except OSError:
+            log_age = None
+
+        return {
+            "installed": True,
+            "version": client_version(),
+            "daemon_running": bool(dpid),
+            "ui_running": bool(upid),
+            "state": state,
+            "paused": live["paused"],
+            "paused_since": live["paused_since"],
+            "offline": live["offline"],
+            "offline_since": live["offline_since"],
+            "connection": conn,
+            "sessions": sess,
+            "pending": len(live["queue"]),
+            "current": live["current"],
+            "queue": live["queue"][:queue_n],
+            "last_activity": live["last_activity"],
+            "last_error": live["last_error"],
+            "recent": recent(conf, limit=recent_n),
+            "unsynced": problems,
+            "unsynced_count": len(problems),
+            "skipped_count": skipped,
+            "log_age": log_age,
+            "settings": settings(conf),
+        }
+
+    # ---- control
+
+    def _client_env(self):
+        env = dict(os.environ)
+        # The client ships only the xcb platform plugin, so it must go via
+        # XWayland. Hyprland exports DISPLAY; fall back to :0 for hotkeys
+        # started from a bare environment.
+        env.setdefault("DISPLAY", ":0")
+        env["QT_QPA_PLATFORM"] = "xcb"
+        return env
+
+    def _send(self, verb, require_running=True):
+        """Hand a verb to the running client via its single-instance socket.
+
+        The launcher starts a throwaway UI process that forwards the word to
+        the live instance and exits; nothing comes back on stdout. When no
+        instance is running the launcher would start one instead, which is
+        wanted for `show` and surprising for `pause`.
+        """
+        if shutil.which(LAUNCHER) is None:
+            raise SystemExit(f"syndctl: {LAUNCHER} not on PATH — is synology-drive-client installed?")
+        if require_running and not _proc_running("cloud-drive-ui"):
+            raise SystemExit("syndctl: Synology Drive Client is not running (start it with: syndctl show)")
+        rc, _, err = _run([LAUNCHER, verb], timeout=25, env=self._client_env())
+        if rc != 0:
+            err = "\n".join(l for l in err.splitlines()
+                            if not l.startswith(("debug.message", "qt.qpa"))).strip()
+            raise SystemExit(f"syndctl: {LAUNCHER} {verb} failed (rc {rc}){': ' + err if err else ''}")
+
+    def show(self):
+        self._send("show", require_running=False)
+
+    def reveal(self, path):
+        """Select `path` in the file manager (Nautilus), else open its folder."""
+        if not path or not os.path.lexists(path):
+            raise SystemExit(f"syndctl: no such file: {path}")
+        if shutil.which("nautilus"):
+            cmd = ["nautilus", "--select", path]
+            if shutil.which("uwsm-app"):
+                cmd = ["uwsm-app", "--"] + cmd
+        else:
+            cmd = ["xdg-open", path if os.path.isdir(path) else os.path.dirname(path)]
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        return path
+
+    def open(self, session_id=None):
+        sess = sessions(self.conf)
+        folder = None
+        if session_id is not None:
+            for s in sess:
+                if s["id"] == session_id:
+                    folder = s["folder"]
+        elif sess:
+            folder = sess[0]["folder"]
+        if not folder or not os.path.isdir(folder):
+            raise SystemExit(f"syndctl: no sync folder for session {session_id}")
+        subprocess.Popen(["xdg-open", folder], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        return folder
+
+
+# ---------------------------------------------------------------------------
+
+def doctor():
+    """Check every link from the client to the bar widget.
+
+    An absent widget can have many causes that look identical from outside;
+    this says which link is broken and how to fix it.
+    """
+    checks = []
+
+    def add(ok, label, detail="", fix=""):
+        checks.append((ok, label, detail, fix))
+
+    # 1. the client
+    add(installed(), "Synology Drive Client installed", CLIENT_CONF,
+        "yay -S synology-drive-client-bin   # or synology-drive from the AUR")
+    conf = read_conf()
+    dpid = daemon_pid(conf) if conf else None
+    upid = _proc_running("cloud-drive-ui")
+    add(bool(dpid), "Sync daemon running",
+        f"cloud-drive-daemon pid {dpid}" if dpid else "",
+        f"QT_QPA_PLATFORM=xcb {LAUNCHER} start   # or log out and in")
+    add(bool(upid), "Client UI running (tray + settings window)",
+        f"cloud-drive-ui pid {upid}" if upid else "",
+        f"QT_QPA_PLATFORM=xcb {LAUNCHER} start")
+    add(shutil.which(LAUNCHER) is not None, "synology-drive launcher on PATH",
+        shutil.which(LAUNCHER) or "", "install the client package")
+
+    # 2. its data
+    conn = connection(conf) if conf else None
+    add(conn is not None, "Client database readable",
+        os.path.join(conf.get("db_path", ""), "sys.sqlite") if conf else "",
+        "check ~/.SynologyDrive/data/db permissions")
+    add(bool(conn and conn["linked"]), "Linked to a NAS",
+        f"{conn['user']}@{conn['server']}:{conn['port']}" if conn else "",
+        "link a NAS in the Synology Drive Client window: syndctl show")
+    sess = sessions(conf) if conf else []
+    add(bool(sess), "At least one sync folder",
+        ", ".join(f"{s['name']} -> {s['folder']}" for s in sess),
+        "add a sync task in the client window: syndctl show")
+    log = _log_path(conf) if conf else ""
+    try:
+        age = int(time.time() - os.path.getmtime(log))
+        log_ok, log_detail = True, f"{log} ({age}s old)"
+    except OSError:
+        log_ok, log_detail = False, log
+    add(log_ok, "Daemon log readable", log_detail,
+        "check ~/.SynologyDrive/log permissions")
+    if log_ok:
+        live = parse_log(log_tail(conf))
+        add(not live["offline"], "NAS reachable (per daemon log)",
+            "" if not live["offline"] else "last channel failure newer than last success",
+            "check the NAS / VPN / Tailscale link, then: syndctl show")
+        if live["paused"]:
+            add(True, "Sync paused by user", "syndctl resume to continue", "")
+
+    # 3. plugin
+    plug = os.path.expanduser("~/.config/omarchy/plugins/" + PLUGIN_ID)
+    add(os.path.isdir(plug), "Plugin installed", plug,
+        "omarchy plugin add " + REPO_URL + " --enable")
+    missing = [f for f in REQUIRED_FILES if not os.path.exists(os.path.join(plug, f))]
+    add(not missing, "Plugin files present",
+        "missing: " + ", ".join(missing) if missing else "",
+        "omarchy plugin update " + PLUGIN_ID)
+
+    # 4. bar layout
+    try:
+        with open(os.path.expanduser("~/.config/omarchy/shell.json")) as f:
+            layout = json.load(f).get("bar", {}).get("layout", {})
+        placed = any(PLUGIN_ID == w.get("id")
+                     for sec in layout.values() for w in sec)
+    except (OSError, ValueError, AttributeError):
+        placed = False
+    add(placed, "Widget placed in the bar", "",
+        "omarchy plugin enable " + PLUGIN_ID + " --section right")
+
+    width = max(len(c[1]) for c in checks)
+    failed = 0
+    for ok, label, detail, fix in checks:
+        mark = "ok  " if ok else "FAIL"
+        line = f"  [{mark}] {label.ljust(width)}"
+        if detail:
+            line += f"  {detail}"
+        print(line)
+        if not ok and fix:
+            print(f"         -> {fix}")
+        failed += 0 if ok else 1
+    print()
+    if failed:
+        print(f"  {failed} check(s) failed.")
+    else:
+        print("  All checks passed. If the widget is still missing, give it "
+              "5s to poll, then: omarchy restart shell")
+    return 1 if failed else 0
+
+
+def _fmt_time(ts):
+    if not ts:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def _fmt_size(n):
+    if n is None:
+        return ""
+    for unit in ("B", "kB", "MB", "GB", "TB"):
+        if n < 1000 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1000
+    return f"{n:.1f} TB"
+
+
+def _print_get(st):
+    c = st["connection"]
+    print(f"  state        {st['state']}"
+          + (f"  (paused since {_fmt_time(st['paused_since'])})" if st["paused"] else ""))
+    print(f"  client       {st['version'] or '-'}  daemon={'up' if st['daemon_running'] else 'down'}"
+          f"  ui={'up' if st['ui_running'] else 'down'}")
+    if c:
+        print(f"  nas          {c['user']}@{c['server']}:{c['port']}"
+              f"{' (ssl)' if c['ssl'] else ''}  status={c['status']} error={c['error']}")
+    for s in st["sessions"]:
+        print(f"  folder       {s['name']:<18} {s['folder']:<28} {s['state']}"
+              + (f"  {s['pending']} pending" if s["pending"] else ""))
+    if st["current"]:
+        cur = st["current"]
+        print(f"  now          {cur['direction']} {cur['path']} ({_fmt_size(cur['size'])})")
+    if st["pending"]:
+        print(f"  pending      {st['pending']}")
+    if st["recent"]:
+        print("  recent")
+        for r in st["recent"]:
+            print(f"    {_fmt_time(r['time'])}  {r['action']:<10} {r['path']}")
+    if st["unsynced"]:
+        print(f"  problems     {st['unsynced_count']}")
+        for r in st["unsynced"]:
+            print(f"    {_fmt_time(r['time'])}  {r['reason']:<22} {r['path']}")
+    if st["skipped_count"]:
+        print(f"  skipped      {st['skipped_count']} excluded by filter")
+
+
+def main():
+    # SUPPRESS matters: without it the subparser re-declares these flags with
+    # their own defaults and clobbers the top-level values, so `--json` only
+    # works on one side of the subcommand.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="machine-readable output")
+
+    ap = argparse.ArgumentParser(prog="syndctl", parents=[common],
+                                 description=__doc__.split("\n\n")[1])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("get", parents=[common])
+    p = sub.add_parser("log", parents=[common])
+    p.add_argument("-n", type=int, default=40)
+    p.add_argument("--offset", type=int, default=0)
+    p = sub.add_parser("unsynced", parents=[common])
+    p.add_argument("-n", type=int, default=20)
+    sub.add_parser("settings", parents=[common])
+    sub.add_parser("show", parents=[common])
+    p = sub.add_parser("open", parents=[common])
+    p.add_argument("session", nargs="?", type=int)
+    p = sub.add_parser("reveal", parents=[common])
+    p.add_argument("path")
+    sub.add_parser("doctor", parents=[common])
+
+    args = ap.parse_args()
+    as_json = getattr(args, "json", False)
+
+    if args.cmd == "doctor":
+        return doctor()
+
+    with Client() as cl:
+        if not cl.conf:
+            raise SystemExit("syndctl: Synology Drive Client is not installed (no " + CLIENT_CONF + ")")
+        if args.cmd == "get":
+            st = cl.get()
+            if as_json:
+                print(json.dumps(st))
+            else:
+                _print_get(st)
+            return 0
+        if args.cmd == "log":
+            rows = recent(cl.conf, limit=args.n, offset=args.offset)
+            if as_json:
+                print(json.dumps(rows))
+            else:
+                for r in rows:
+                    print(f"  {_fmt_time(r['time'])}  {r['action']:<10} {r['path']}")
+            return 0
+        if args.cmd == "unsynced":
+            rows, skipped = unsynced(cl.conf, limit=args.n)
+            if as_json:
+                print(json.dumps({"unsynced": rows, "skipped_count": skipped}))
+            else:
+                for r in rows:
+                    print(f"  {_fmt_time(r['time'])}  {r['reason']:<22} {r['path']}")
+                print(f"  ({skipped} excluded by the client's filter)")
+            return 0
+        if args.cmd == "show":
+            cl.show()
+            return 0
+        if args.cmd == "settings":
+            st = settings(cl.conf)
+            if as_json:
+                print(json.dumps(st))
+            else:
+                for k, v in st["global"].items():
+                    print(f"  {k:<24} {'-' if v is None else v}")
+                for t in st["tasks"]:
+                    f = t["filters"]
+                    print(f"  task {t['id']}  {t['name']:<18} {t['folder']}  {t['direction']}"
+                          f"{'  read-only' if t['read_only'] else ''}")
+                    print(f"      excluded: ext {','.join(f['excluded_extensions']) or '-'}"
+                          f" | prefix {','.join(f['excluded_name_prefixes']) or '-'}"
+                          f" | folders {','.join(f['excluded_folders']) or '-'}")
+            return 0
+        if args.cmd == "reveal":
+            cl.reveal(args.path)
+            return 0
+        if args.cmd == "open":
+            folder = cl.open(args.session)
+            if as_json:
+                print(json.dumps({"opened": folder}))
+            else:
+                print(f"  opened {folder}")
+            return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
