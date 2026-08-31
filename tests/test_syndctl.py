@@ -11,6 +11,8 @@ import os
 import sys
 import unittest
 
+sys.dont_write_bytecode = True   # never leave bin/__pycache__ behind
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CTL = os.path.join(HERE, "..", "bin", "syndctl")
 loader = importlib.machinery.SourceFileLoader("syndctl", CTL)

@@ -29,7 +29,7 @@ file holds only what is specific to this repo.
 
 ```bash
 omarchy plugin validate . && ~/.claude/skills/omarchy-plugin-dev/scripts/lint.sh
-rsync -a --delete --exclude .git ./ ~/.config/omarchy/plugins/dansmith888.synology-drive/
+rsync -a --delete --exclude .git --exclude tests --exclude __pycache__ ./ ~/.config/omarchy/plugins/dansmith888.synology-drive/
 omarchy-shell shell toggle dansmith888.synology-drive '{}'
 qs log -p "$OMARCHY_PATH/shell" --tail 100
 bin/syndctl doctor
