@@ -21,8 +21,10 @@ file holds only what is specific to this repo.
   `reveal`, `doctor`. Holds `PLUGIN_ID` / `REPO_URL` (keep in sync with the
   manifest). `parse_log()` is the heart: daemon.log tail → queue/current/
   paused/offline.
-- `tests/test_syndctl.py` — offline parser tests from real log shapes;
-  `python3 tests/test_syndctl.py`.
+- `PROTOCOL.md` — the daemon's local IPC: sockets, PStream codec, known
+  actions, log markers, re-checks after a client upgrade.
+- `tests/test_syndctl.py` — offline parser + codec tests from real log
+  shapes and captured bytes; `python3 tests/test_syndctl.py`.
 - `docs/SUBMISSION-DRAFT.md` — marketplace issue body (unsubmitted).
 
 ## Dev loop
@@ -47,15 +49,18 @@ bin/syndctl doctor
 
 ## Gotchas
 
-- **Do not add pause/resume via `synology-drive pause|resume`.** Tested
-  2026-08-31 on client 4.0.3-17892: `pause` made the UI send
-  `reload_session` with `sync_mode: 1` for every task (a persisted option in
-  `sys.sqlite system_table` and per-session), did *not* pause, and `resume`
-  was a no-op. Daniel's client still has `sync_mode=1` from that test until
-  he resets it in the client window. A real control path needs either the
-  daemon.sock protocol (protobuf; `get_status`/`pause_session` exist in the
-  binary) or the tray's dbusmenu, which only exposes About/Exit until Qt
-  populates it on click.
+- **Pause/resume go through `daemon.sock` (PROTOCOL.md), never the
+  launcher.** `synology-drive pause` sends `reload_session` with
+  `sync_mode: 1` (rewrites a task option, pauses nothing); `resume` is a
+  no-op. The working request is `{"action":"pause","session_id_list":[…]}`
+  as a bare PStream object — found 2026-09-01 by watching the daemon log
+  while Daniel pressed the native button, then replaying. The daemon acks
+  everything; confirmation is the log line "Pause session N by session id".
+  `sync_mode=1` from the 08-31 test was checked by Daniel in the client and
+  looked fine; left as is.
+- `pause_session`, `get_session_status`, `get_statistics` etc. are NOT IPC
+  actions (daemon logs "<<< Unknown IPC action"); the IPC vocabulary is the
+  string cluster around `get_event_count` in `cloud-drive-daemon`.
 - The `status` verb does not print — it *opens* the client's main window.
 - The daemon echoes its JSON notifications (`{"notify": "syncing_file", …}`)
   into `daemon.log` only when the tray UI is *not* connected ("is not
@@ -64,9 +69,9 @@ bin/syndctl doctor
 - The client ships only the `xcb` Qt platform plugin: anything that runs
   `synology-drive …` needs `DISPLAY` (Hyprland exports `:0`) and
   `QT_QPA_PLATFORM=xcb`, which `syndctl` sets.
-- `history_table.action`: 40 = downloaded, 24 = uploaded, 34/17 = excluded
-  by filter (`not_synced_reason -8192`). Mapped from observed rows; the
-  binaries hold no enum names for them.
+- `history_table.action`: 40 = downloaded, 24 = uploaded, 18 = local
+  deletion synced, 34/17 = excluded by filter (`not_synced_reason -8192`).
+  Mapped from observed rows; the binaries hold no enum names for them.
 - `grim` blocks forever while the display is DPMS-off; screenshots of the
   panel need the monitor awake.
 - Ground truth for the tray state without any parsing:

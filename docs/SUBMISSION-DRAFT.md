@@ -31,8 +31,9 @@ _No response_
 Standard-library Python only, no external binaries, no network, no root.
 Writes nothing outside its own folder and a lock file in `$XDG_RUNTIME_DIR`.
 Reads the Synology Drive Client's own SQLite databases (read-only) and log
-under `~/.SynologyDrive`; never writes client settings. Requires the
-official client to be installed and linked. Executes only
+under `~/.SynologyDrive`; never writes client settings. Pause/resume are sent to the daemon's local
+Unix socket in the client's own request format (documented in PROTOCOL.md).
+Requires the official client to be installed and linked. Executes only
 `synology-drive show`, `nautilus --select` and `xdg-open`.
 
 ### Submission checklist

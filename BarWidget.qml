@@ -20,6 +20,7 @@ BarWidget {
   readonly property string syncState: panel ? panel.syncState : ""
   readonly property int pending: panel ? panel.pending : 0
   readonly property var current: panel ? panel.current : null
+  readonly property bool paused: panel ? panel.paused === true : false
 
   // While a transfer runs the glyph alternates between "cloud-sync" and the
   // direction of the current file, so the pill visibly moves without a
@@ -88,6 +89,8 @@ BarWidget {
     function toggle(): void { root.togglePanel() }
     function refresh(): void { root.broadcast("refresh") }
     function state(): string { return root.syncState }
+    function pause(): void { if (root.panel && !root.paused) root.panel.togglePauseAll() }
+    function resume(): void { if (root.panel && root.paused) root.panel.togglePauseAll() }
   }
 
   // WidgetButton, not BarIconButton: the latter is glyph-only and clips text.
@@ -124,7 +127,7 @@ BarWidget {
 
     onPressed: function(b) {
       if (b === Qt.MiddleButton) root.refresh()
-      else if (b === Qt.RightButton) { if (root.panel) root.panel.showClient() }
+      else if (b === Qt.RightButton) { if (root.panel) root.panel.togglePauseAll() }
       else root.togglePanel()
     }
   }

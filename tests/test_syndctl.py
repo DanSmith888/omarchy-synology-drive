@@ -179,6 +179,37 @@ class ParseLog(unittest.TestCase):
         self.assertFalse(s["offline"])
 
 
+class PStream(unittest.TestCase):
+    """Wire format per PROTOCOL.md; the ack frame is the daemon's real reply."""
+
+    def test_ack_frame_bytes(self):
+        self.assertEqual(syndctl.ps_encode({"ack": "ok"}), b"B\x10\x00\x03ack\x10\x00\x02ok@")
+        self.assertEqual(syndctl.ps_decode(b"B\x10\x00\x03ack\x10\x00\x02ok@"), ({"ack": "ok"}, 13))
+
+    def test_integer_widths(self):
+        for v, want in [(0, b"\x01\x01\x00"), (255, b"\x01\x01\xff"), (256, b"\x01\x02\x01\x00"),
+                        (0x10000, b"\x01\x04\x00\x01\x00\x00"),
+                        (0x1_0000_0000, b"\x01\x08\x00\x00\x00\x01\x00\x00\x00\x00")]:
+            self.assertEqual(syndctl.ps_encode(v), want, v)
+            self.assertEqual(syndctl.ps_decode(want)[0], v)
+
+    def test_roundtrip_nested(self):
+        obj = {"action": "pause", "session_id_list": [1, 2], "note": "héllo", "flag": True, "none": None}
+        got, n = syndctl.ps_decode(syndctl.ps_encode(obj))
+        self.assertEqual(got, {"action": "pause", "session_id_list": [1, 2], "note": "héllo", "flag": 1, "none": None})
+        self.assertEqual(n, len(syndctl.ps_encode(obj)))
+
+    def test_pause_request_shape(self):
+        # What the client's own Pause button sends, as observed on 4.0.3.
+        b = syndctl.ps_encode({"action": "pause", "session_id_list": [2]})
+        self.assertEqual(b, b"B\x10\x00\x06action\x10\x00\x05pause"
+                            b"\x10\x00\x0fsession_id_list\x41\x01\x01\x02\x40@")
+
+    def test_unknown_tag_raises(self):
+        with self.assertRaises(ValueError):
+            syndctl.ps_decode(b"{")
+
+
 class Helpers(unittest.TestCase):
     def test_history_action_names(self):
         self.assertEqual(syndctl.HISTORY_ACTION[40], "downloaded")

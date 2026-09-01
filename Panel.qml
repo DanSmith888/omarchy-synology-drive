@@ -13,10 +13,10 @@ import qs.Ui
 // left to the bar widget so the target is registered once.
 //
 // Everything here is read from what the Synology Drive Client already keeps
-// on disk (its SQLite databases and daemon log) via bin/syndstatus. The
-// client is only ever asked to show its own window; nothing under the sync
-// folders is touched, and no client setting is written. See README "Good to
-// know" for why there is no pause button.
+// on disk (its SQLite databases and daemon log) via bin/syndstatus. Pause and
+// resume go to the sync daemon over its local socket with the same request
+// the client's own button sends (PROTOCOL.md); nothing under the sync folders
+// is touched, and no client setting is written.
 Panel {
   id: root
   moduleName: "dansmith888.synology-drive"
@@ -39,6 +39,7 @@ Panel {
   property bool devicePresent: false   // client installed
   property string syncState: ""        // uptodate|syncing|paused|offline|error|stopped|unlinked
   property bool paused: false
+  property var pausedSessions: []      // ids currently paused
   property bool offline: false
   property bool daemonRunning: false
   property bool uiRunning: false
@@ -109,6 +110,7 @@ Panel {
   function actionGlyph(a) {
     if (a === "download" || a === "downloaded") return "󰇚"
     if (a === "upload" || a === "uploaded") return "󰕒"
+    if (a === "deleted") return "󰆴"
     return "󰓦"
   }
 
@@ -165,6 +167,24 @@ Panel {
   function reveal(path) { if (path) apply(["reveal", path]) }
   function showClient() { apply(["show"]) }
 
+  readonly property bool canControl: root.daemonRunning && root.syncState !== "stopped" && root.syncState !== "unlinked"
+
+  // Optimistic: flip the local state before the daemon confirms so the button
+  // and pill react at once; the next poll (triggered by onExited) is truth.
+  function togglePauseAll() {
+    if (!root.canControl || root.busy) return
+    var next = !root.paused
+    root.paused = next
+    root.syncState = next ? "paused" : (root.pending > 0 ? "syncing" : "uptodate")
+    apply([next ? "pause" : "resume"])
+  }
+
+  function togglePauseSession(id) {
+    if (!root.canControl || root.busy) return
+    var isPaused = root.pausedSessions.indexOf(id) !== -1
+    apply([isPaused ? "resume" : "pause", String(id)])
+  }
+
   Process {
     id: statusProc
     command: [root.pluginDir + "bin/syndstatus"]
@@ -186,6 +206,7 @@ Panel {
           root.stale = false
           root.syncState = String(d.state)
           root.paused = d.paused === true
+          root.pausedSessions = Array.isArray(d.paused_sessions) ? d.paused_sessions : []
           root.offline = d.offline === true
           root.daemonRunning = d.daemon_running === true
           root.uiRunning = d.ui_running === true
@@ -264,7 +285,10 @@ Panel {
     property bool clickable: false
     property bool urgent: false
     property real glyphOpacity: 1.0
+    property string actionGlyph: ""      // optional small button on the right
+    property string actionTooltip: ""
     signal activated()
+    signal actionTriggered()
 
     width: parent ? parent.width : implicitWidth
     implicitHeight: Math.max(Style.spacing.popupRowHeight, rowLabels.implicitHeight + Style.space(6))
@@ -316,9 +340,24 @@ Panel {
       }
     }
 
+    PanelActionButton {
+      id: rowAction
+      visible: row.actionGlyph !== ""
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(4)
+      anchors.verticalCenter: parent.verticalCenter
+      iconText: row.actionGlyph
+      tooltipText: row.actionTooltip
+      foreground: root.barForeground
+      fontFamily: root.fontFamily
+      fontSize: Style.font.iconSmall
+      enabled: !root.busy
+      onClicked: row.actionTriggered()
+    }
+
     Text {
       id: rowTrailing
-      anchors.right: parent.right
+      anchors.right: rowAction.visible ? rowAction.left : parent.right
       anchors.rightMargin: Style.space(6)
       anchors.verticalCenter: parent.verticalCenter
       text: row.trailing
@@ -329,7 +368,11 @@ Panel {
 
     MouseArea {
       id: rowMouse
-      anchors.fill: parent
+      // Leave the action button its own hit area.
+      anchors.left: parent.left
+      anchors.top: parent.top
+      anchors.bottom: parent.bottom
+      anchors.right: rowAction.visible ? rowAction.left : parent.right
       hoverEnabled: true
       cursorShape: row.clickable ? Qt.PointingHandCursor : Qt.ArrowCursor
       onClicked: if (row.clickable) row.activated()
@@ -423,7 +466,8 @@ Panel {
                                                     logFlick.contentY + dy * Style.spacing.popupRowHeight))
       }
       onTextKey: function(t) {
-        if (t === "r" || t === "R") root.refresh()
+        if (t === "p" || t === "P") root.togglePauseAll()
+        else if (t === "r" || t === "R") root.refresh()
         else if (t === "o" || t === "O") root.showClient()
         else if (t === "s" || t === "S") root.settingsOpen = !root.settingsOpen
       }
@@ -481,13 +525,14 @@ Panel {
           }
           trailingControl: Component {
             PanelActionButton {
-              iconText: "󰑐"
-              tooltipText: "Refresh now"
+              visible: root.canControl
+              iconText: root.paused ? "󰐊" : "󰏤"
+              tooltipText: root.paused ? "Resume syncing (all tasks)" : "Pause syncing (all tasks)"
               foreground: root.barForeground
               fontFamily: root.fontFamily
               bordered: true
               enabled: !root.busy
-              onClicked: root.refresh()
+              onClicked: root.togglePauseAll()
             }
           }
         }
@@ -510,7 +555,8 @@ Panel {
             root.tick
             if (root.syncState === "stopped") return "The Synology Drive Client is not running. Start it to resume syncing."
             if (root.syncState === "unlinked") return "The client is not linked to a NAS yet. Open it to set up a connection."
-            if (root.paused) return "Syncing is paused in the client. Resume it from the Synology Drive window."
+            if (root.paused) return root.pausedSessions.length === root.sessions.length
+                ? "Syncing is paused." : "Some tasks are paused."
             if (root.offline && root.connection) return "Can't reach " + root.connection.server + " — the client keeps retrying."
             return ""
           }
@@ -585,6 +631,9 @@ Panel {
             clickable: true
             tooltip: "Open " + root.tilde(modelData.folder)
             onActivated: root.openFolder(modelData.id)
+            actionGlyph: root.canControl ? (root.pausedSessions.indexOf(modelData.id) !== -1 ? "󰐊" : "󰏤") : ""
+            actionTooltip: (root.pausedSessions.indexOf(modelData.id) !== -1 ? "Resume " : "Pause ") + modelData.name
+            onActionTriggered: root.togglePauseSession(modelData.id)
           }
         }
 
@@ -679,12 +728,15 @@ Panel {
               ActivityRow {
                 required property var modelData
                 glyph: root.actionGlyph(modelData.action)
-                glyphOpacity: modelData.exists === false ? 0.4 : 1.0
+                // A deleted entry's file is meant to be gone; only dim the
+                // ones that vanished behind the client's back.
+                glyphOpacity: modelData.exists === false && modelData.action !== "deleted" ? 0.4 : 1.0
                 title: modelData.name
                 subtitle: (modelData.action === "downloaded" ? "Downloaded to "
-                         : modelData.action === "uploaded" ? "Uploaded from " : "Changed in ")
+                         : modelData.action === "uploaded" ? "Uploaded from "
+                         : modelData.action === "deleted" ? "Deleted from " : "Changed in ")
                         + root.tilde(modelData.folder)
-                        + (modelData.exists === false ? " · gone" : "")
+                        + (modelData.exists === false && modelData.action !== "deleted" ? " · gone" : "")
                 trailing: { root.tick; return root.relTime(modelData.time) }
                 clickable: modelData.exists === true
                 tooltip: modelData.exists === true ? "Show " + modelData.path + " in Files" : modelData.path
@@ -798,7 +850,7 @@ Panel {
             fontFamily: root.fontFamily
             fontSize: Style.font.caption
             enabled: !root.busy
-            tooltipText: "The client's own window: pause, link a NAS, add sync tasks, filters"
+            tooltipText: "The client's own window: link a NAS, add sync tasks, filters"
             onClicked: root.showClient()
           }
 

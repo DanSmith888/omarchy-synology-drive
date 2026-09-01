@@ -73,20 +73,21 @@ something to know:
 | 󰧠 Error | A connection or task error — see the panel |
 | 󰅤 | Client not running / not linked |
 
-**Left-click** opens the panel. **Right-click** raises the Synology Drive
-window. **Middle-click** forces a refresh. To open the panel from a hotkey:
+**Left-click** opens the panel. **Right-click** pauses or resumes all
+syncing. **Middle-click** forces a refresh. From a hotkey:
 
 ```bash
 omarchy-shell shell toggle dansmith888.synology-drive
+omarchy-shell dansmith888.synology-drive pause     # or resume
 ```
 
 **The panel** shows, top to bottom:
 
-- who you are linked as and the overall state;
+- who you are linked as, the overall state, and a pause/resume-all button;
 - **Now** — the file being transferred, its direction and size, and what is
   queued behind it (only while something is moving);
 - **Sync folders** — each task with its local path and state; click to open
-  the folder;
+  the folder, or use its pause/resume button;
 - **Problems** — files the client refused to sync, with the reason (only when
   there are any; temporaries excluded by the client's own filter are not
   problems and are not listed);
@@ -97,8 +98,8 @@ omarchy-shell shell toggle dansmith888.synology-drive
   startup, notifications, overlay, per-task direction and filter rules;
 - **Open Synology Drive** for everything else.
 
-Keys while open: `r` refresh, `o` open the client, `s` fold/unfold settings,
-arrows scroll the log, `Esc` closes.
+Keys while open: `p` pause/resume all, `r` refresh, `o` open the client,
+`s` fold/unfold settings, arrows scroll the log, `Esc` closes.
 
 ### Settings
 
@@ -117,8 +118,13 @@ In the Omarchy bar editor (or `shell.json`):
   icon reacts to.
 - **History and problems** come from `history.sqlite`, the same table the
   client's Logs page shows.
-- **Control** is limited to raising the client's window and opening folders
-  or files. See below for why.
+- **Pause / resume** talk to the sync daemon over its local socket
+  (`~/.SynologyDrive/daemon.sock`) with the very request the client's own
+  Pause button sends — `{"action": "pause", "session_id_list": [...]}` in
+  Synology's PStream encoding — and confirm it from the daemon log. Per
+  task or all at once. Everything about that channel is in
+  [PROTOCOL.md](PROTOCOL.md).
+- Nothing else is written: no client setting, nothing under the sync folders.
 
 ## Requirements
 
@@ -134,20 +140,27 @@ syndctl get [--json]              connection, sync folders, activity, state
 syndctl log [-n N] [--json]       sync history, newest first
 syndctl unsynced [--json]         files the client refused to sync
 syndctl settings [--json]         the client's options, read-only
+syndctl pause [<session-id>...]   pause syncing (all tasks, or the given ones)
+syndctl resume [<session-id>...]  resume syncing
 syndctl show                      raise the client's own window
 syndctl open [<session-id>]       open a sync folder in the file manager
 syndctl reveal <path>             select a file in the file manager
+syndctl ipc <action> [k=v ...]    raw request to the daemon (see PROTOCOL.md)
 syndctl doctor                    check every link from the client to the bar
 ```
 
 ## Good to know
 
-- **There is no pause button, on purpose.** The client's launcher accepts
-  `synology-drive pause` / `resume`, and they are not what they look like:
-  on 4.0.3 `pause` sent a `reload_session` with `sync_mode: 1` to the daemon
-  (a persisted per-task option), did not pause anything, and `resume` did
-  nothing at all. Until there is a documented way to pause from outside, use
-  the Pause button in the client window (right-click the pill).
+- **Pause is not persisted by the client.** It lives in the daemon's memory,
+  so a client restart or reboot resumes syncing — same as the native button.
+- **Don't use `synology-drive pause`/`resume` from the launcher.** On 4.0.3
+  `pause` sends a `reload_session` that rewrites a per-task option
+  (`sync_mode`) and pauses nothing; `resume` is a no-op. The plugin never
+  calls them.
+- The daemon acknowledges every request, valid or not; the plugin therefore
+  treats the daemon's own log line ("Pause session N by session id") as the
+  confirmation, and says "sent (daemon has not logged it yet)" when it does
+  not appear within a few seconds.
 - "Pending" counts come from the daemon log, not a live query, so they are
   accurate to the poll interval (4 s while syncing) and can miss files that
   were queued before the current log file started. The daemon rotates its
@@ -163,7 +176,8 @@ syndctl doctor                    check every link from the client to the bar
 Omarchy plugins run inside the shell process, unsandboxed, as your user.
 This one runs two Python scripts from its own `bin/` — standard library
 only, no extra packages, no binaries, no network, nothing that needs root.
-It opens the client's databases read-only, reads its log, and writes
+It opens the client's databases read-only, reads its log, sends pause /
+resume / event-count requests to the daemon's local Unix socket, and writes
 nothing outside its folder except a lock file in `$XDG_RUNTIME_DIR`. The
 only things it ever executes besides itself are `synology-drive show`,
 `nautilus --select` and `xdg-open`.

@@ -12,14 +12,17 @@ Usage:
   syndctl log [-n N] [--json]       sync history, newest first (the client's Logs page)
   syndctl unsynced [--json]         files the client refused to sync
   syndctl settings [--json]         the client's options, read-only
+  syndctl pause [<session-id>...]   pause syncing (all tasks, or the given ones)
+  syndctl resume [<session-id>...]  resume syncing
   syndctl show                      raise the client's own window
   syndctl open [<session-id>]       open a sync folder in the file manager
   syndctl reveal <path>             select a file in the file manager
+  syndctl ipc <action> [k=v ...]    raw request to the daemon (research; see PROTOCOL.md)
   syndctl doctor                    check every link from the client to the bar
 
-pause/resume are deliberately absent: the client's `synology-drive pause`
-verb turned out to rewrite a per-task setting (sync_mode) rather than pause,
-and there is no other documented control path yet. See README "Good to know".
+pause/resume speak to the sync daemon directly over its local socket, with
+the same request the client's own Pause button sends — not the launcher's
+`synology-drive pause` verb, which rewrites a task setting instead.
 """
 
 import argparse
@@ -29,7 +32,9 @@ import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import time
@@ -59,6 +64,7 @@ LOG_TAIL_BYTES = 1_000_000
 HISTORY_ACTION = {
     40: "downloaded",   # server -> local add/update
     24: "uploaded",     # local change pushed to the NAS
+    18: "deleted",      # local deletion propagated to the NAS
     34: "skipped",      # file excluded by the client's filter
     17: "skipped",      # directory excluded by the client's filter
 }
@@ -404,6 +410,137 @@ def settings(conf):
 
 
 # ---------------------------------------------------------------------------
+# Daemon IPC: bare PStream objects over ~/.SynologyDrive/daemon.sock
+#
+# PStream is Synology's own serialisation (the NAS protocol uses it too):
+#   null    00 00              integer 01 <size 1|2|4|8> <big-endian>
+#   string  10 <u16be len> …   array   41 … 40        map  42 (str value)* 40
+# The local socket carries one bare object per request, no length prefix; the
+# daemon answers with a map that always carries "ack": "ok" (it acks before
+# it parses — an unknown action is still acked, and logged as
+# "<<< Unknown IPC action"). Details and the observed vocabulary: PROTOCOL.md.
+
+_PS_NULL, _PS_INT, _PS_STR, _PS_BIN, _PS_END, _PS_ARR, _PS_MAP = 0x00, 0x01, 0x10, 0x30, 0x40, 0x41, 0x42
+IPC_TIMEOUT = 3.0
+
+
+def ps_encode(obj, buf=None):
+    b = bytearray() if buf is None else buf
+    if obj is None:
+        b += b"\x00\x00"
+    elif isinstance(obj, bool):
+        ps_encode(int(obj), b)
+    elif isinstance(obj, int):
+        b.append(_PS_INT)
+        if obj < 0x100:
+            b += bytes([1, obj])
+        elif obj < 0x10000:
+            b += b"\x02" + struct.pack(">H", obj)
+        elif obj < 0x1_0000_0000:
+            b += b"\x04" + struct.pack(">I", obj)
+        else:
+            b += b"\x08" + struct.pack(">Q", obj)
+    elif isinstance(obj, str):
+        raw = obj.encode()
+        b.append(_PS_STR)
+        b += struct.pack(">H", len(raw)) + raw
+    elif isinstance(obj, (list, tuple)):
+        b.append(_PS_ARR)
+        for item in obj:
+            ps_encode(item, b)
+        b.append(_PS_END)
+    elif isinstance(obj, dict):
+        b.append(_PS_MAP)
+        for k, v in obj.items():
+            ps_encode(str(k), b)
+            ps_encode(v, b)
+        b.append(_PS_END)
+    else:
+        raise TypeError(f"PStream cannot encode {type(obj).__name__}")
+    return bytes(b)
+
+
+def ps_decode(buf, i=0):
+    """(object, next_index). Raises ValueError on an unknown tag."""
+    tag = buf[i]
+    if tag == _PS_NULL:
+        return None, i + 2
+    if tag == _PS_INT:
+        n = buf[i + 1]
+        return int.from_bytes(buf[i + 2:i + 2 + n], "big"), i + 2 + n
+    if tag == _PS_STR:
+        n = struct.unpack(">H", buf[i + 1:i + 3])[0]
+        return buf[i + 3:i + 3 + n].decode("utf-8", "replace"), i + 3 + n
+    if tag == _PS_BIN:
+        n = struct.unpack(">I", buf[i + 1:i + 5])[0]
+        return buf[i + 5:i + 5 + n], i + 5 + n
+    if tag == _PS_ARR:
+        i += 1
+        out = []
+        while buf[i] != _PS_END:
+            v, i = ps_decode(buf, i)
+            out.append(v)
+        return out, i + 1
+    if tag == _PS_MAP:
+        i += 1
+        out = {}
+        while buf[i] != _PS_END:
+            k, i = ps_decode(buf, i)
+            v, i = ps_decode(buf, i)
+            out[k] = v
+        return out, i + 1
+    raise ValueError(f"PStream: unknown tag 0x{tag:02x} at offset {i}")
+
+
+def daemon_call(conf, request, timeout=IPC_TIMEOUT):
+    """Send one request map to the daemon, return the list of reply objects.
+
+    None when the socket is absent or refuses (daemon not running). The
+    daemon closes the connection after replying, so read to EOF.
+    """
+    path = conf.get("socket_path") or os.path.join(DRIVE_DIR, "daemon.sock")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(path)
+        sock.sendall(ps_encode(request))
+        data = b""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        return None
+    finally:
+        sock.close()
+    out, i = [], 0
+    try:
+        while i < len(data):
+            obj, i = ps_decode(data, i)
+            out.append(obj)
+    except (ValueError, IndexError, struct.error):
+        out.append({"_undecoded": data[i:].hex()})
+    return out
+
+
+def daemon_ok(reply):
+    return bool(reply) and isinstance(reply[0], dict) and reply[0].get("ack") == "ok"
+
+
+def event_count(conf, session_id):
+    """Pending event count for one session straight from the daemon, or None."""
+    r = daemon_call(conf, {"action": "get_event_count", "session_id": int(session_id)}, timeout=0.8)
+    if daemon_ok(r) and isinstance(r[0].get("event_count"), int):
+        return r[0]["event_count"]
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Daemon log: the only place live activity shows up
 
 _PREFIX_RE = re.compile(
@@ -654,6 +791,11 @@ class Client:
         for s in sess:
             q = by_session.get(s["id"], [])
             s["pending"] = len(q)
+            # The daemon's own count: exact, and it survives log rotation.
+            # Log-derived pending keeps the file names; this keeps it honest.
+            s["event_count"] = event_count(conf, s["id"]) if dpid else None
+            if s["event_count"] and not q:
+                s["pending"] = s["event_count"]
             s["idle_since"] = live["idle_at"].get(s["id"])
             if not dpid:
                 s["state"] = "stopped"
@@ -678,7 +820,7 @@ class Client:
             state = "error"
         elif live["offline"]:
             state = "offline"
-        elif live["queue"]:
+        elif live["queue"] or any(s["pending"] for s in sess):
             state = "syncing"
         else:
             state = "uptodate"
@@ -695,12 +837,13 @@ class Client:
             "ui_running": bool(upid),
             "state": state,
             "paused": live["paused"],
+            "paused_sessions": live["paused_sessions"],
             "paused_since": live["paused_since"],
             "offline": live["offline"],
             "offline_since": live["offline_since"],
             "connection": conn,
             "sessions": sess,
-            "pending": len(live["queue"]),
+            "pending": max(len(live["queue"]), sum(s["pending"] for s in sess)),
             "current": live["current"],
             "queue": live["queue"][:queue_n],
             "last_activity": live["last_activity"],
@@ -741,6 +884,69 @@ class Client:
             err = "\n".join(l for l in err.splitlines()
                             if not l.startswith(("debug.message", "qt.qpa"))).strip()
             raise SystemExit(f"syndctl: {LAUNCHER} {verb} failed (rc {rc}){': ' + err if err else ''}")
+
+    def _wait_marker(self, markers, since, timeout=4.0):
+        """True once every marker appears in the daemon log at or after `since`."""
+        path = _log_path(self.conf)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            seen = set()
+            for line in _tail(path, 65536).decode("utf-8", "replace").splitlines()[::-1]:
+                m = _PREFIX_RE.match(line)
+                if not m:
+                    continue
+                ts = _ts(m.group(1))
+                if ts is not None and ts < since - 1:
+                    break                       # older than our request: stop scanning
+                for mk in markers:
+                    if mk in line:
+                        seen.add(mk)
+            if seen >= set(markers):
+                return True
+            time.sleep(0.25)
+        return False
+
+    def _session_ids(self, wanted):
+        known = {s["id"]: s for s in sessions(self.conf)}
+        if not wanted:
+            return [i for i, s in known.items() if s["enabled"]]
+        bad = [i for i in wanted if i not in known]
+        if bad:
+            raise SystemExit(f"syndctl: no such sync task: {', '.join(map(str, bad))} (have {', '.join(map(str, known))})")
+        return list(wanted)
+
+    def _pause_resume(self, verb, wanted):
+        """`verb` is 'pause' or 'resume'. Same request the client's button sends:
+        {"action": verb, "session_id_list": [ids]}. Confirmed by the daemon's
+        per-session log line; pause is not persisted anywhere else."""
+        if not daemon_pid(self.conf):
+            raise SystemExit("syndctl: sync daemon is not running")
+        ids = self._session_ids(wanted)
+        since = int(time.time())
+        reply = daemon_call(self.conf, {"action": verb, "session_id_list": ids})
+        if reply is None:
+            raise SystemExit("syndctl: daemon socket did not answer")
+        if not daemon_ok(reply):
+            raise SystemExit(f"syndctl: daemon rejected {verb}: {reply!r}")
+        word = "Pause" if verb == "pause" else "Resume"
+        confirmed = self._wait_marker([f"{word} session {i} by session id" for i in ids], since)
+        return {"action": verb, "sessions": ids, "confirmed": confirmed}
+
+    def pause(self, wanted=()):
+        return self._pause_resume("pause", wanted)
+
+    def resume(self, wanted=()):
+        return self._pause_resume("resume", wanted)
+
+    def ipc(self, action, fields):
+        if not daemon_pid(self.conf):
+            raise SystemExit("syndctl: sync daemon is not running")
+        req = {"action": action}
+        req.update(fields)
+        reply = daemon_call(self.conf, req)
+        if reply is None:
+            raise SystemExit("syndctl: daemon socket did not answer")
+        return reply
 
     def show(self):
         self._send("show", require_running=False)
@@ -824,6 +1030,11 @@ def doctor():
         log_ok, log_detail = False, log
     add(log_ok, "Daemon log readable", log_detail,
         "check ~/.SynologyDrive/log permissions")
+    if dpid:
+        r = daemon_call(conf, {"action": "get_event_count", "session_id": sess[0]["id"] if sess else 1}, timeout=1.5)
+        add(daemon_ok(r), "Daemon IPC answers (pause/resume, event counts)",
+            f"event_count={r[0].get('event_count')}" if daemon_ok(r) else repr(r),
+            "restart the client: synology-drive quit; " + LAUNCHER + " start")
     if log_ok:
         live = parse_log(log_tail(conf))
         add(not live["offline"], "NAS reachable (per daemon log)",
@@ -935,6 +1146,13 @@ def main():
     p = sub.add_parser("unsynced", parents=[common])
     p.add_argument("-n", type=int, default=20)
     sub.add_parser("settings", parents=[common])
+    p = sub.add_parser("pause", parents=[common])
+    p.add_argument("session", nargs="*", type=int)
+    p = sub.add_parser("resume", parents=[common])
+    p.add_argument("session", nargs="*", type=int)
+    p = sub.add_parser("ipc", parents=[common])
+    p.add_argument("ipc_action")
+    p.add_argument("field", nargs="*", help="key=value; value parsed as JSON when it is one")
     sub.add_parser("show", parents=[common])
     p = sub.add_parser("open", parents=[common])
     p.add_argument("session", nargs="?", type=int)
@@ -992,6 +1210,27 @@ def main():
                     print(f"      excluded: ext {','.join(f['excluded_extensions']) or '-'}"
                           f" | prefix {','.join(f['excluded_name_prefixes']) or '-'}"
                           f" | folders {','.join(f['excluded_folders']) or '-'}")
+            return 0
+        if args.cmd in ("pause", "resume"):
+            r = cl.pause(args.session) if args.cmd == "pause" else cl.resume(args.session)
+            if as_json:
+                print(json.dumps(r))
+            else:
+                what = "all tasks" if not args.session else "task " + ", ".join(map(str, r["sessions"]))
+                print(f"  {args.cmd}d {what}" if r["confirmed"]
+                      else f"  {args.cmd} sent for {what} (daemon has not logged it yet)")
+            return 0
+        if args.cmd == "ipc":
+            fields = {}
+            for f in args.field:
+                if "=" not in f:
+                    raise SystemExit(f"syndctl: expected key=value, got {f!r}")
+                k, v = f.split("=", 1)
+                try:
+                    fields[k] = json.loads(v)
+                except json.JSONDecodeError:
+                    fields[k] = v
+            print(json.dumps(cl.ipc(args.ipc_action, fields), default=repr))
             return 0
         if args.cmd == "reveal":
             cl.reveal(args.path)
