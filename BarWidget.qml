@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell.Io
+import qs.Commons
 import qs.Ui
 
 // Synology Drive: the pill in the bar, and the host for the panel.
@@ -93,28 +94,51 @@ BarWidget {
     function resume(): void { if (root.panel && root.paused) root.panel.togglePauseAll() }
   }
 
+  // Glyph alone when everything is fine; a word or a count only when there
+  // is something to know. That is the whole point versus the old tray icon.
+  readonly property string pillText: {
+    if (!root.panel) return ""
+    var g = root.panel.stateGlyph(root.syncState)
+    switch (root.syncState) {
+    case "syncing":
+      if (root.phase && root.current) g = root.panel.directionGlyph(root.current.direction)
+      return g + "  " + root.pending
+    case "paused":   return g + "  Paused"
+    case "offline":  return g + "  Offline"
+    case "error":    return g + "  Error"
+    default:         return g
+    }
+  }
+
+  // Reserve the width the pill has actually needed in its current state, so
+  // a count going 9 -> 12 -> 3 never shoves the neighbours; reset when the
+  // state changes, because a "Paused" reserve would otherwise leave a hole
+  // beside the bare glyph for the rest of the session.
+  property real reservedWidth: 0
+  onSyncStateChanged: reservedWidth = 0
+
+  TextMetrics {
+    id: pillMetrics
+    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+    font.pixelSize: Style.font.body
+    text: root.pillText
+    onWidthChanged: if (width > root.reservedWidth) root.reservedWidth = width
+  }
+
   // WidgetButton, not BarIconButton: the latter is glyph-only and clips text.
   WidgetButton {
     id: button
     anchors.fill: parent
     bar: root.bar
-    // Glyph alone when everything is fine; a word or a count only when there
-    // is something to know. That is the whole point versus the old tray icon.
-    text: {
-      if (!root.panel) return ""
-      var g = root.panel.stateGlyph(root.syncState)
-      switch (root.syncState) {
-      case "syncing":
-        if (root.phase && root.current) g = root.panel.directionGlyph(root.current.direction)
-        return g + "  " + root.pending
-      case "paused":   return g + "  Paused"
-      case "offline":  return g + "  Offline"
-      case "error":    return g + "  Error"
-      default:         return g
-      }
-    }
+    text: root.pillText
     hasVisualContent: text !== ""
-    horizontalMargin: 8.75
+    // WidgetButton centres its label, so slack sits either side and the
+    // neighbours never move. pillMetrics stays in the max so a reading can
+    // never be clipped by a stale reserve.
+    fixedWidth: pillMetrics.width > 0
+      ? Math.max(root.reservedWidth, pillMetrics.width, labelWidth) + scaledHorizontalMargin * 2
+      : -1
+    horizontalMargin: 5
     verticalPadding: 8.75
     active: root.syncState === "error"
     tooltipText: {

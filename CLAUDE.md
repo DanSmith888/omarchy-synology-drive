@@ -85,5 +85,10 @@ bin/syndctl doctor
 - Checklist pass 2026-09-01: click/Esc/summon/hide/toggle, reopen after
   close, border vs `omarchy.tailscale`, disable→enable→restart,
   remove→zero residue→reinstall — all verified by screenshot.
+- Pill width: grow-only reserve per state (`reservedWidth`, reset on
+  `syncState` change) so counts don't shove neighbours and a "Paused"
+  reserve doesn't linger. Measured 2026-09-01 with `grim -t ppm` + column
+  thresholding: neighbour gaps 16–21 px, ours 24/15 (glyph bearing), resumed
+  == idle to the pixel.
 - Screenshot geometry: `grim -g` takes logical px; the display is 5120×2160
   at scale 1.25. The panel opens at roughly `3286,28 412x572`.
