@@ -245,8 +245,9 @@ Panel {
 
   // Steady state: quick while a transfer is running so the pill count tracks
   // it, relaxed when idle. The probe is a log-tail parse, ~130 ms end to end.
+  // 6 s idle keeps a pause made in the client visible within a glance.
   Timer {
-    interval: !root.devicePresent ? 5000 : root.syncState === "syncing" ? 4000 : 15000
+    interval: !root.devicePresent ? 5000 : root.syncState === "syncing" ? 4000 : 6000
     running: true
     repeat: true
     triggeredOnStart: true

@@ -171,8 +171,9 @@ syndctl doctor                    check every link from the client to the bar
   were queued before the current log file started. The daemon rotates its
   log at 5 MB; the plugin reads the newest rotated file too when the live
   one is young.
-- The plugin polls: every 15 s idle, 4 s while syncing, 3 s while the panel
-  is open. Each poll is one short Python process (~130 ms).
+- The plugin polls: every 6 s idle, 4 s while syncing, 3 s while the panel
+  is open, and whenever you hover the pill. Each poll is one short Python
+  process (~130 ms).
 - If the client is not running the pill shows a struck-through cloud and
   the footer button starts it.
 

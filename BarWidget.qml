@@ -125,6 +125,9 @@ BarWidget {
       return t
     }
 
+    // Hovering the pill is how people "check" it, so make that a real refresh.
+    onTooltipHoveredChanged: if (tooltipHovered) root.refresh()
+
     onPressed: function(b) {
       if (b === Qt.MiddleButton) root.refresh()
       else if (b === Qt.RightButton) { if (root.panel) root.panel.togglePauseAll() }
