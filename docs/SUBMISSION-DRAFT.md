@@ -1,5 +1,5 @@
 <!--
-Marketplace submission for https://plugins.omarchy.org — unsubmitted draft.
+Marketplace submission for https://plugins.omarchy.org, unsubmitted draft.
 Before submitting: push the repo and tag, strip this comment, then:
 
   gh issue create --repo HANCORE-linux/omarchy-plugin-marketplace \
@@ -31,7 +31,7 @@ _No response_
 A bar front-end for the official Synology Drive Client for Linux; it does no
 syncing itself. **Depends on the AUR package `synology-drive` (or
 `synology-drive-client-bin`)** being installed, linked to a NAS running
-Synology Drive Server, and running — the README's "Before you start" walks
+Synology Drive Server, and running; the README's "Before you start" walks
 through it. Tested against 4.0.3-17892.
 
 Standard-library Python only, no external binaries, no network, no root.
