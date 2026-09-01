@@ -76,6 +76,20 @@ Panel {
 
   readonly property string pluginDir: Qt.resolvedUrl(".").toString().replace("file://", "")
 
+  // A stalled command must not wedge polling. Any Process still running when
+  // this fires is cancelled, so the next poll starts clean.
+  property int watchdogSeconds: 10
+  Timer {
+    interval: root.watchdogSeconds * 1000
+    repeat: true
+    running: true
+    onTriggered: {
+      if (statusProc.running) statusProc.running = false
+      if (actionProc.running) actionProc.running = false
+    }
+  }
+
+
   // ---- Presentation helpers shared with the pill.
 
   function stateText(s) {
@@ -302,6 +316,8 @@ Panel {
     }
 
     Text {
+
+      textFormat: Text.PlainText
       id: rowGlyph
       anchors.left: parent.left
       anchors.leftMargin: Style.space(6)
@@ -323,6 +339,8 @@ Panel {
       spacing: Style.space(1)
 
       Text {
+
+        textFormat: Text.PlainText
         width: parent.width
         text: row.title
         color: root.barForeground
@@ -331,6 +349,7 @@ Panel {
         elide: Text.ElideMiddle
       }
       Text {
+        textFormat: Text.PlainText
         width: parent.width
         visible: row.subtitle !== ""
         text: row.subtitle
@@ -357,6 +376,8 @@ Panel {
     }
 
     Text {
+
+      textFormat: Text.PlainText
       id: rowTrailing
       anchors.right: rowAction.visible ? rowAction.left : parent.right
       anchors.rightMargin: Style.space(6)
@@ -389,6 +410,7 @@ Panel {
     width: parent ? parent.width : implicitWidth
     implicitHeight: Math.max(pairLabel.implicitHeight, pairValue.implicitHeight)
     Text {
+      textFormat: Text.PlainText
       id: pairLabel
       anchors.left: parent.left
       anchors.leftMargin: Style.space(6)
@@ -398,6 +420,7 @@ Panel {
       font.pixelSize: Style.font.caption
     }
     Text {
+      textFormat: Text.PlainText
       id: pairValue
       anchors.right: parent.right
       anchors.rightMargin: Style.space(6)
@@ -430,6 +453,7 @@ Panel {
       fontFamily: root.fontFamily
     }
     Text {
+      textFormat: Text.PlainText
       anchors.right: parent.right
       anchors.rightMargin: Style.space(6)
       anchors.verticalCenter: parent.verticalCenter
@@ -518,6 +542,7 @@ Panel {
           iconOpacity: root.stale ? 0.5 : 1
           iconComponent: Component {
             Text {
+              textFormat: Text.PlainText
               text: root.stateGlyph(root.syncState)
               color: root.syncState === "error" ? root.urgent : root.barForeground
               font.family: root.fontFamily
@@ -546,6 +571,7 @@ Panel {
 
         // ---- Something needs saying: paused / offline / stopped.
         Text {
+          textFormat: Text.PlainText
           width: parent.width
           visible: text !== ""
           wrapMode: Text.WordWrap
@@ -601,6 +627,8 @@ Panel {
         }
 
         Text {
+
+          textFormat: Text.PlainText
           visible: root.pending > 5
           width: parent.width
           text: "+" + (root.pending - 5) + " more queued"
@@ -746,6 +774,8 @@ Panel {
             }
 
             Text {
+
+              textFormat: Text.PlainText
               visible: root.logRows.length === 0
               width: parent.width
               text: root.logFilter === "downloaded" ? "No downloads in the last " + root.recent.length + " entries."
@@ -761,6 +791,8 @@ Panel {
         }
 
         Text {
+
+          textFormat: Text.PlainText
           visible: root.recent.length === 0 && root.devicePresent && root.syncState !== "stopped"
           width: parent.width
           text: "No transfers yet."
@@ -805,6 +837,7 @@ Panel {
               spacing: Style.space(3)
               topPadding: Style.space(6)
               Text {
+                textFormat: Text.PlainText
                 text: taskRow.modelData.name + " · " + taskRow.modelData.direction + (taskRow.modelData.read_only ? " · read-only" : "")
                 color: root.barForeground
                 font.family: root.fontFamily
@@ -820,6 +853,8 @@ Panel {
           }
 
           Text {
+
+            textFormat: Text.PlainText
             width: parent.width
             text: "To change any of these, open the Synology Drive window."
             color: root.dim
@@ -856,6 +891,8 @@ Panel {
           }
 
           Text {
+
+            textFormat: Text.PlainText
             anchors.left: footerButton.right
             anchors.leftMargin: Style.space(10)
             anchors.right: parent.right

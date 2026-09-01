@@ -16,20 +16,96 @@ to show. Standard library only. No root, no network.
 import json
 import os
 import subprocess
+import re
+import select
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLIENT_CONF = os.path.expanduser("~/.SynologyDrive/data/config/client.conf")
 TIMEOUT = 10
 
 
-def run(cmd, timeout=TIMEOUT):
-    """stdout on success, None on any failure. Never raises, never hangs."""
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.stdout if r.returncode == 0 else None
-    except Exception:
-        return None
+# Ceiling on what any one command may hand back.
+MAX_OUTPUT = 262144
 
+# Strings that reach the UI come from other programs: bluetoothctl decorates
+# its output with ANSI escapes, and a filename is whatever someone called a
+# file. Strip escape sequences and control characters and cap the length, so
+# nothing can carry terminal control codes or unbounded text into a panel.
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+TEXT_MAX = 200
+
+
+def safe_text(value, limit=TEXT_MAX):
+    if value is None:
+        return None
+    out = _CTRL.sub("", _ANSI.sub("", str(value)))
+    return out[:limit].strip()
+
+
+
+def scrub(value):
+    """Sanitise every string in a payload, however deeply nested.
+
+    Applied once at the boundary rather than at each field, so a new field
+    added later cannot quietly skip it.
+    """
+    if isinstance(value, str):
+        return safe_text(value)
+    if isinstance(value, list):
+        return [scrub(v) for v in value]
+    if isinstance(value, dict):
+        return {k: scrub(v) for k, v in value.items()}
+    return value
+
+
+def run(cmd, timeout=TIMEOUT, limit=MAX_OUTPUT):
+    """stdout on success, None on any failure. Never raises, never hangs.
+
+    Reads at most `limit` bytes and enforces `timeout` across the whole read,
+    not just around process exit: a command that produces nothing and never
+    exits would otherwise block for as long as it liked.
+    """
+    proc = None
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL)
+        fd = proc.stdout.fileno()
+        deadline = time.monotonic() + timeout
+        chunks, total, truncated = [], 0, False
+        while total < limit:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if not select.select([fd], [], [], remaining)[0]:
+                break
+            chunk = os.read(fd, min(65536, limit - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        else:
+            truncated = True
+        proc.stdout.close()
+        try:
+            rc = proc.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=1)
+            rc = None
+        if not chunks:
+            return None
+        if rc == 0 or truncated:
+            return b"".join(chunks).decode("utf-8", "replace")
+        return None
+    except Exception:
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return None
 
 def main():
     if not os.path.isfile(CLIENT_CONF):
@@ -45,7 +121,7 @@ def main():
                 state.update(d)
         except json.JSONDecodeError:
             pass
-    print(json.dumps(state))
+    print(json.dumps(scrub(state)))
 
 
 if __name__ == "__main__":
