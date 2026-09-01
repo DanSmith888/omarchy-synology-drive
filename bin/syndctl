@@ -38,6 +38,7 @@ import struct
 import subprocess
 import sys
 import time
+import stat
 
 PLUGIN_ID = "dansmith888.synology-drive"
 REPO_URL = "https://github.com/DanSmith888/omarchy-synology-drive.git"
@@ -46,7 +47,49 @@ REQUIRED_FILES = ("manifest.json", "BarWidget.qml", "Panel.qml",
 
 # Never /tmp: a predictable shared path could be pre-created by another user.
 _RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-LOCK_PATH = os.path.join(_RUNTIME_DIR, "syndctl.lock")
+# Our own 0700 directory inside the runtime dir, rather than a predictable
+# name sitting directly in a shared one. The lock is opened O_NOFOLLOW and
+# never truncated, so a symlink planted at the path is refused rather than
+# followed and its target clobbered.
+_TOOL = "syndctl"
+_STATE_DIR = os.path.join(_RUNTIME_DIR, "dansmith888.synology-drive")
+LOCK_PATH = os.path.join(_STATE_DIR, "lock")
+
+def state_dir():
+    """Our private runtime directory, verified before use.
+
+    Creating it is not enough: check with lstat that what is there is a real
+    directory we own, not a symlink pointing somewhere else, and that nobody
+    else can write to it.
+    """
+    try:
+        os.makedirs(_STATE_DIR, mode=0o700, exist_ok=True)
+    except OSError as exc:
+        raise SystemExit(f"{_TOOL}: cannot create {_STATE_DIR}: {exc}")
+    try:
+        st = os.lstat(_STATE_DIR)
+    except OSError as exc:
+        raise SystemExit(f"{_TOOL}: cannot stat {_STATE_DIR}: {exc}")
+    if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+        raise SystemExit(f"{_TOOL}: {_STATE_DIR} is not a directory")
+    if st.st_uid != os.getuid():
+        raise SystemExit(f"{_TOOL}: {_STATE_DIR} is not owned by this user")
+    if st.st_mode & 0o077:
+        os.chmod(_STATE_DIR, 0o700)
+    return _STATE_DIR
+
+
+def open_nofollow(path, flags, mode=0o600):
+    """Open without following a final symlink, and only if it is a regular file."""
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a regular file")
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
 LOCK_TIMEOUT = 30.0
 TIMEOUT = 10
 
@@ -765,7 +808,11 @@ class Client:
     """
 
     def __enter__(self):
-        self._lock = open(LOCK_PATH, "w")
+        state_dir()
+        # O_RDWR|O_CREAT, never O_TRUNC: the lock file's contents are
+        # irrelevant, and truncating whatever is at the path is the bug.
+        self._lock = os.fdopen(
+            open_nofollow(LOCK_PATH, os.O_RDWR | os.O_CREAT), "r+")
         deadline = time.monotonic() + LOCK_TIMEOUT
         while True:
             try:
