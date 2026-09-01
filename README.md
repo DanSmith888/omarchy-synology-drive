@@ -1,76 +1,53 @@
 # Synology Drive
 
-Synology Drive Client status in the [Omarchy](https://omarchy.org/) bar —
-what's syncing, what failed, the sync log — without the Qt tray icon.
+Synology Drive Client status in the [Omarchy](https://omarchy.org/) bar:
+what is syncing, what failed, the sync log, pause and resume. No Qt tray icon.
 
-The official Synology Drive Client for Linux syncs well and looks dreadful
-under Hyprland: an XWayland Qt5 tray icon whose popups die on hover. This
-plugin leaves the client doing the syncing and replaces only the part you
-look at. It reads the state the client already keeps on disk (its SQLite
-databases and daemon log under `~/.SynologyDrive`), so there is nothing to
-configure, no credentials, and no traffic to the NAS.
+The official Linux client syncs well but its XWayland tray icon is unusable
+under Hyprland. This plugin leaves the client doing the syncing and replaces
+the part you look at. It reads the client's own SQLite databases and daemon
+log under `~/.SynologyDrive`, so there is nothing to configure, no
+credentials, and no traffic to the NAS.
 
 ![Bar](docs/bar.png)
 ![Panel](docs/panel.png)
 
 ## Before you start
 
-This plugin is a front-end. It needs the official **Synology Drive Client**
-installed, linked to your NAS and running — it does no syncing of its own.
+The plugin is a front-end. It needs the official Synology Drive Client
+installed, linked to your NAS, and running.
 
-1. **Install the client from the AUR.** Either package works; both ship the
-   same vendor binaries under `/opt/Synology/SynologyDrive`:
+1. Install the client from the AUR:
 
    ```bash
-   yay -S synology-drive              # 4.2.x, the maintained one
-   yay -S synology-drive-client-bin   # 4.0.3 — what this plugin was developed and tested against
+   yay -S synology-drive              # 4.2.x
+   yay -S synology-drive-client-bin   # 4.0.3, the version this was tested with
    ```
 
-   Synology Drive Server must be installed on the NAS (Package Center).
+   The NAS needs Synology Drive Server from Package Center.
 
-2. **Run it once and link it.** Launch *Synology Drive Client* from the app
-   menu (or `synology-drive start`). The wizard asks for the NAS address,
-   user and password — a Tailscale hostname is fine — then creates your
-   first sync task (which shares to which local folders, two-way or
-   one-way). Do this in the client; the plugin only reads the result.
+2. Launch *Synology Drive Client* once and complete the wizard: NAS address
+   (a Tailscale hostname works), user, password, then your first sync task.
 
-3. **Autostart is the client's own.** First run writes
-   `~/.config/autostart/synology-drive-autostart.desktop`, so it comes back
-   at every login. The client only ships the `xcb` Qt platform plugin, so
-   it runs under XWayland — that is normal and nothing to fix.
-
-Once `synology-drive` is linked you never need its tray icon again; that is
-the part this plugin replaces.
+3. The client writes its own autostart entry
+   (`~/.config/autostart/synology-drive-autostart.desktop`). It runs under
+   XWayland because it only ships the `xcb` Qt plugin; that is normal.
 
 ## Install
-
-No setup, no root:
 
 ```bash
 omarchy plugin add https://github.com/DanSmith888/omarchy-synology-drive.git --enable
 ```
 
-### Hide the old tray icon
-
-Once the pill is up, hide the client's own tray item. Right-click it in the
-Omarchy tray and choose hide, or add it to the tray's hidden list in
-`~/.config/omarchy/shell.json`:
-
-```json
-{ "id": "omarchy.tray", "hidden": ["cloud-drive-ui"] }
-```
-
-The client keeps running; only its icon goes.
+Then hide the client's tray item: right-click it in the Omarchy tray, or add
+`"hidden": ["cloud-drive-ui"]` to the `omarchy.tray` entry in
+`~/.config/omarchy/shell.json`. The client keeps running.
 
 ### Check it
 
 ```bash
 ~/.config/omarchy/plugins/dansmith888.synology-drive/bin/syndctl doctor
 ```
-
-Verifies every link from the client to the bar and tells you how to fix
-whatever is broken. Put `bin/` on your `PATH` if you want `syndctl` as a
-command.
 
 ## Update
 
@@ -84,156 +61,103 @@ omarchy plugin update dansmith888.synology-drive && omarchy restart shell
 omarchy plugin remove dansmith888.synology-drive
 ```
 
-That removes everything. The plugin never touches anything outside its own
-folder and a lock file in `$XDG_RUNTIME_DIR`.
+Nothing is left behind except a lock file in `$XDG_RUNTIME_DIR`.
 
 ## Using it
-
-**The pill** is a cloud glyph that only says something when there is
-something to know:
 
 | Pill | Meaning |
 |------|---------|
 | 󰅠 | Up to date |
-| 󰘿 3 | Syncing — 3 files pending; the glyph alternates with ↓/↑ for the current file |
-| 󰅟 Paused | Paused in the client |
-| 󰅤 Offline | The NAS can't be reached; the client is retrying |
-| 󰧠 Error | A connection or task error — see the panel |
-| 󰅤 | Client not running / not linked |
+| 󰘿 3 | Syncing, 3 files pending (glyph alternates with the transfer direction) |
+| 󰅟 Paused | Paused |
+| 󰅤 Offline | NAS unreachable, client retrying |
+| 󰧠 Error | Connection or task error, see the panel |
+| 󰅤 | Client not running or not linked |
 
-**Left-click** opens the panel. **Right-click** pauses or resumes all
-syncing. **Middle-click** forces a refresh. From a hotkey:
+Left-click opens the panel. Right-click pauses or resumes everything.
+Middle-click or hover refreshes.
 
 ```bash
 omarchy-shell shell toggle dansmith888.synology-drive
 omarchy-shell dansmith888.synology-drive pause     # or resume
 ```
 
-**The panel** shows, top to bottom:
+The panel shows the link and overall state with a pause/resume button;
+**Now**, the file in flight and the queue; **Sync folders**, each task with
+its own pause button (click to open the folder); **Problems**, files the
+client refused; **Log**, the sync history with download/upload filters
+(click an entry to select the file in Files); **Settings**, the client's
+options, read-only; and a button for the client's own window.
 
-- who you are linked as, the overall state, and a pause/resume-all button;
-- **Now** — the file being transferred, its direction and size, and what is
-  queued behind it (only while something is moving);
-- **Sync folders** — each task with its local path and state; click to open
-  the folder, or use its pause/resume button;
-- **Problems** — files the client refused to sync, with the reason (only when
-  there are any; temporaries excluded by the client's own filter are not
-  problems and are not listed);
-- **Log** — the client's sync history, newest first, scrolling. Filter to
-  downloads or uploads. Click an entry to select that file in Files; entries
-  whose file is gone are dimmed;
-- **Settings** (folded) — the client's options as it has them, read-only:
-  startup, notifications, overlay, per-task direction and filter rules;
-- **Open Synology Drive** for everything else.
+Keys: `p` pause/resume, `r` refresh, `o` open the client, `s` settings,
+arrows scroll the log, `Esc` closes.
 
-Keys while open: `p` pause/resume all, `r` refresh, `o` open the client,
-`s` fold/unfold settings, arrows scroll the log, `Esc` closes.
+Settings (bar editor or `shell.json`): `hideWhenIdle` (off) hides the pill
+while up to date; `logCount` (40) is the number of log entries kept.
 
-### Settings
+## How it works
 
-In the Omarchy bar editor (or `shell.json`):
-
-- `hideWhenIdle` (off) — hide the pill entirely while everything is up to date.
-- `logCount` (40) — how many log entries the panel keeps.
-
-## What it does
-
-- **State** comes from `~/.SynologyDrive/data/db/sys.sqlite` (connection,
-  sync tasks) and a tail of `~/.SynologyDrive/log/daemon.log` (what is
-  queued, what is moving, pause/offline markers). The daemon narrates every
-  transfer as `PushEvent` / `PullEvent` / `DoneEvent` and announces an idle
-  folder with "event pool is now empty", which is exactly what the tray
-  icon reacts to.
-- **History and problems** come from `history.sqlite`, the same table the
-  client's Logs page shows.
-- **Pause / resume** talk to the sync daemon over its local socket
-  (`~/.SynologyDrive/daemon.sock`) with the very request the client's own
-  Pause button sends — `{"action": "pause", "session_id_list": [...]}` in
-  Synology's PStream encoding — and confirm it from the daemon log. Per
-  task or all at once. Everything about that channel is in
-  [PROTOCOL.md](PROTOCOL.md).
-- Nothing else is written: no client setting, nothing under the sync folders.
+- Connection and sync tasks: `~/.SynologyDrive/data/db/sys.sqlite`.
+- History and problems: `history.sqlite`, the client's own Logs table.
+- Live state: a tail of `daemon.log`. The daemon logs `PushEvent`,
+  `PullEvent` and `DoneEvent` per file, "event pool is now empty" when a
+  task is idle, and "Pause session N" markers.
+- Pause and resume: the same request the client's Pause button sends, over
+  the daemon's local socket. See [PROTOCOL.md](PROTOCOL.md).
+- Nothing is written: no client setting, nothing in the sync folders.
 
 ## Requirements
 
-- Omarchy (Quattro or later) on Arch
-- Synology Drive Client 4.x for Linux from the AUR — tested with
-  `synology-drive-client-bin` 4.0.3-17892; 4.2.x should work but its log
-  lines have not been checked (see Limitations)
-- Synology Drive Server on the NAS, and the client linked to it
-- Nautilus for "show in Files" (falls back to `xdg-open` on the folder)
+- Omarchy (Quattro or later)
+- Synology Drive Client 4.x from the AUR, linked to a NAS running Synology
+  Drive Server. Tested with 4.0.3-17892; 4.2.x is untested.
+- Nautilus for "select in Files" (falls back to `xdg-open`)
 
 ## Command line
 
 ```
-syndctl get [--json]              connection, sync folders, activity, state
-syndctl log [-n N] [--json]       sync history, newest first
+syndctl get [--json]              state, tasks, activity
+syndctl log [-n N] [--json]       history, newest first
 syndctl unsynced [--json]         files the client refused to sync
 syndctl settings [--json]         the client's options, read-only
-syndctl pause [<session-id>...]   pause syncing (all tasks, or the given ones)
-syndctl resume [<session-id>...]  resume syncing
-syndctl show                      raise the client's own window
-syndctl open [<session-id>]       open a sync folder in the file manager
+syndctl pause [<id>...]           pause all tasks, or the given ones
+syndctl resume [<id>...]          resume
+syndctl show                      raise the client's window
+syndctl open [<id>]               open a sync folder
 syndctl reveal <path>             select a file in the file manager
-syndctl ipc <action> [k=v ...]    raw request to the daemon (see PROTOCOL.md)
-syndctl doctor                    check every link from the client to the bar
+syndctl ipc <action> [k=v ...]    raw daemon request (PROTOCOL.md)
+syndctl doctor                    check every link from client to bar
 ```
 
 ## Limitations
 
-Things the plugin deliberately does not do, and things it cannot know:
+- Settings are read-only. Change tasks, filters, bandwidth, proxy and
+  linking in the client's window.
+- Pause is not persisted by the client; a restart or reboot resumes.
+- The client's own tray and window do not notice pauses made from the bar
+  until you next act in the client. The daemon is correct either way.
+- Pending counts come from the daemon log plus its event count. No per-file
+  progress or speed; the daemon logs start and end, not bytes.
+- No quota or server-side view; the plugin never talks to the NAS.
+- One client version verified. The log line shapes are pinned in
+  `tests/test_syndctl.py`, so a format change fails a test instead of
+  silently blanking the pill.
+- Backup tasks and on-demand sync are not modelled.
+- The launcher's `synology-drive pause` verb is not used: on 4.0.3 it
+  rewrites a task option (`sync_mode`) and pauses nothing.
+- Polling: 6 s idle, 4 s while syncing, 3 s with the panel open, plus on
+  hover. Each poll is one short Python process (about 130 ms).
 
-- **Settings are read-only.** Sync tasks, filters, selective sync,
-  bandwidth, proxy, notifications and linking are changed in the client's
-  own window ("Open Synology Drive"). The panel shows the current values so
-  you rarely need to open it.
-- **Pause is not persisted by the client.** It lives in the sync daemon's
-  memory, so a client restart or reboot resumes syncing — same as the
-  native button.
-- **The native app's own status lags behind pauses made from the bar.** Its
-  tray tooltip and window only reflect pauses it performed itself; the
-  daemon (which the plugin reads) is right, and the app catches up on its
-  next own action. Pauses made *in* the app — by task or by connection —
-  show up in the plugin within one poll.
-- **Pending counts and the "now" row come from the daemon's log**, cross-
-  checked with the daemon's own event count. They are accurate to the poll
-  interval (4 s while syncing) and cannot show per-file progress or speed:
-  the daemon logs a transfer's start and end, not its bytes.
-- **No quota, no server-side view.** The plugin never talks to the NAS. What
-  is shared with you, versions, storage usage — that is the client or DSM.
-- **One client version verified.** The daemon log format (`PushEvent`,
-  `DoneEvent`, "pool is now empty", "Pause session N by … id") is what the
-  live state is parsed from. It has been stable across Drive releases for
-  years and `tests/test_syndctl.py` pins the exact shapes, so a change shows
-  up as a failing test rather than a silently blank pill — but 4.2.x has not
-  been run against it yet. Connection, tasks, history and settings come
-  from SQLite and are unaffected.
-- **Linux client only.** On-demand sync, the Windows/macOS file-provider
-  modes and backup tasks are not modelled; a backup task will show up as a
-  sync folder with its own status.
-- **Don't use `synology-drive pause`/`resume` from the launcher.** On 4.0.3
-  `pause` sends a `reload_session` that rewrites a per-task option
-  (`sync_mode`) and pauses nothing; `resume` is a no-op. The plugin never
-  calls them; it uses the daemon's own socket ([PROTOCOL.md](PROTOCOL.md)).
-- The daemon acknowledges every request, valid or not; the plugin therefore
-  treats the daemon's own log line as the confirmation and says "sent
-  (daemon has not logged it yet)" when it does not appear within a few
-  seconds.
-- Polling: every 6 s idle, 4 s while syncing, 3 s with the panel open, and
-  on hovering the pill. Each poll is one short Python process (~130 ms).
+### Hyprland tips for the client's windows
 
-### Hyprland tips for the client's own windows
-
-Not the plugin's business, but you will hit them the first time you open a
-task's Sync Rules. The client is XWayland, so Qt places its dialogs
-relative to where it *thinks* the parent window is, which is nowhere near
-where Hyprland put it. In `~/.config/hypr/hyprland.lua`:
+The client is XWayland, so Qt places dialogs relative to where it thinks
+the parent is. In `~/.config/hypr/hyprland.lua`:
 
 ```lua
--- Centre the main window and every dialog (they all float).
+-- Centre the main window and dialogs.
 o.window({ class = "^cloud-drive-ui$", title = "^[A-Z]" }, { center = true })
 
--- Qt re-positions a dialog after mapping; centre it again once it has.
+-- Qt moves a dialog again after mapping; centre it once more.
 hl.on("window.open", function(win)
   if win.class ~= "cloud-drive-ui" or not tostring(win.title):match("^%u") then return end
   local selector = "address:" .. (tostring(win.address):gsub("^address:", ""))
@@ -246,64 +170,46 @@ hl.on("window.open", function(win)
 end)
 ```
 
-If you still want the client's tray popup for anything, keep it reachable
-with `o.window({ class = "^cloud-drive-ui$", title = "^(cloud-drive-ui)?$", float = true }, { stay_focused = true, move = { "(monitor_w-window_w-20)", "(36)" } })`
-— matched on the popup's title, not on `float`, or every dialog gets
-pinned under the tray icon with the mouse "stuck".
+If you keep the client's tray popup, match it by title, not by `float`,
+or every dialog gets pinned under the tray icon:
+`o.window({ class = "^cloud-drive-ui$", title = "^(cloud-drive-ui)?$", float = true }, { stay_focused = true, move = { "(monitor_w-window_w-20)", "(36)" } })`.
 
 ## What runs, and as whom
 
 Omarchy plugins run inside the shell process, unsandboxed, as your user.
-This one runs two Python scripts from its own `bin/` — standard library
-only, no extra packages, no binaries, no network, nothing that needs root.
-It opens the client's databases read-only, reads its log, sends pause /
-resume / event-count requests to the daemon's local Unix socket, and writes
-nothing outside its folder except a lock file in `$XDG_RUNTIME_DIR`. The
-only things it ever executes besides itself are `synology-drive show`,
+This one runs two standard-library Python scripts from its own `bin/`: no
+packages, no binaries, no network, no root. It reads the client's databases
+read-only and its log, sends pause/resume/event-count requests to the
+daemon's local Unix socket, and writes nothing outside its folder except a
+lock file in `$XDG_RUNTIME_DIR`. It executes only `synology-drive show`,
 `nautilus --select` and `xdg-open`.
 
 ## Hacking on it
 
 ```bash
-git clone https://github.com/DanSmith888/omarchy-synology-drive.git ~/Work/omarchy-synology-drive
-cd ~/Work/omarchy-synology-drive
-python3 tests/test_syndctl.py                 # log-line shapes + PStream bytes, offline
+python3 tests/test_syndctl.py      # log-line shapes and PStream bytes, offline
 omarchy plugin validate .
-# Copy (never symlink — the validator rejects symlinks) into the plugins
-# dir; the shell hot-reloads on save, restart it when Panel.qml changes.
 rsync -a --delete --exclude .git --exclude tests --exclude __pycache__ ./ ~/.config/omarchy/plugins/dansmith888.synology-drive/
-omarchy restart shell
+omarchy restart shell              # needed when Panel.qml changes
 bin/syndctl doctor
-```
-
-Poke the daemon safely while tailing its log:
-
-```bash
 tail -F ~/.SynologyDrive/log/daemon.log | grep -vE 'rescan-handler|barrier.cpp'
-bin/syndctl ipc get_event_count session_id=1
 ```
 
-## Protocol
-
-[PROTOCOL.md](PROTOCOL.md) documents the client's local IPC as observed:
-the sockets, Synology's PStream encoding, the known actions and log
-markers, and what to re-check after a client upgrade.
+Never symlink the repo into the plugins dir; the validator rejects symlinks.
 
 ## Related
 
-- [m1guelpf/sproto](https://github.com/m1guelpf/sproto) — a Rust client for
-  the client↔NAS sync protocol; its PStream notes made the local socket
-  legible.
-- [zbjdonald/synology-drive-api](https://github.com/zbjdonald/synology-drive-api)
-  — the DSM-side REST API (list/upload/download/share), if you want to talk
-  to the NAS rather than the client.
+- [m1guelpf/sproto](https://github.com/m1guelpf/sproto): Rust client for the
+  client-to-NAS sync protocol; its PStream notes decoded the local socket.
+- [zbjdonald/synology-drive-api](https://github.com/zbjdonald/synology-drive-api):
+  the DSM REST API, for talking to the NAS rather than the client.
 
 ## Credits
 
-Built for and with Daniel's setup — an Arch/Omarchy workstation syncing
-two shares from a DiskStation over Tailscale. Synology Drive is a trademark
-of Synology Inc.; this project is not affiliated with Synology.
+I built this for my own setup: an Arch/Omarchy workstation syncing two
+shares from a DiskStation over Tailscale. Synology Drive is a trademark of
+Synology Inc.; this project is not affiliated with Synology.
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
