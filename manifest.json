@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "dansmith888.synology-drive",
   "name": "Synology Drive",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "Daniel Smith",
   "license": "MIT",
   "description": "Synology Drive Client status in the bar: what's syncing, what failed, pause/resume — without the Qt tray icon.",

@@ -153,6 +153,11 @@ syndctl doctor                    check every link from the client to the bar
 
 - **Pause is not persisted by the client.** It lives in the daemon's memory,
   so a client restart or reboot resumes syncing — same as the native button.
+- **The native app's own status lags behind pauses made from the bar.** Its
+  tray tooltip and window only reflect pauses it performed itself; the
+  daemon (which the plugin reads) is right, the app catches up on its next
+  own action. Pauses made *in* the app — by task or by connection — show up
+  in the plugin within one poll.
 - **Don't use `synology-drive pause`/`resume` from the launcher.** On 4.0.3
   `pause` sends a `reload_session` that rewrites a per-task option
   (`sync_mode`) and pauses nothing; `resume` is a no-op. The plugin never

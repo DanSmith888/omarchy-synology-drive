@@ -72,6 +72,7 @@ Confirmed by sending them and reading the daemon's reaction:
 |---|---|---|
 | `{"action":"pause","session_id_list":[N,…]}` | pause those sync tasks | `daemon-impl.cpp(2154): Pause session N by session id.` then `remove N worker process` |
 | `{"action":"resume","session_id_list":[N,…]}` | resume them | `daemon-impl.cpp(2255): Resume session N by session id.` then `add N worker process` |
+| `{"action":"pause","connection_id_list":[C]}` (sent by the client when the NAS entry is selected; not exercised by the plugin) | pause every task on that connection | `daemon-impl.cpp(2166): Pause session N by connection id.` per task |
 | `{"action":"get_event_count","session_id":N}` | pending event count | — (reply `{"ack":"ok","event_count":K}`) |
 
 Seen in the log as sent by the UI, not exercised by the plugin:
@@ -83,7 +84,6 @@ launcher's `synology-drive pause` verb sends exactly this (with
 the launcher for control.
 
 Names present in the binary next to the ones above, untested:
-`connection_id_list` (probably `pause`/`resume` by connection),
 `reload_connection`, `unlink_connection`, `add_event`, `dump_event`,
 `add_watch_session`, `remove_watch_session`, `get_file_id`, `lock_file`,
 `abort_bkp_event`. Names that looked promising but are **not** IPC actions
@@ -107,6 +107,15 @@ un-pauses. `syndctl get` derives `paused` / `paused_sessions` from those
 lines (per session, reset when the daemon pid in the log prefix changes).
 `WorkerManager: pause all worker` / `resume all worker` also appear on every
 session reload and mean nothing on their own.
+
+## The UI does not follow external changes
+
+`cloud-drive-ui` keeps its own pause state and only updates it for actions
+it initiated. After a `pause`/`resume` sent by anything else (this plugin)
+its tray tooltip and window keep showing the previous state until the user
+acts in the app. Observed 2026-09-01: app pauses by connection → plugin
+resumes → daemon logs `Resume session N by session id` and syncs, tooltip
+still says "Paused". The daemon is authoritative; read it, not the UI.
 
 ## Research tooling
 

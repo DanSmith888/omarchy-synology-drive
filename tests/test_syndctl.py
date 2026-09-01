@@ -145,6 +145,19 @@ class ParseLog(unittest.TestCase):
     def test_reload_is_not_a_pause(self):
         self.assertFalse(syndctl.parse_log(RELOAD_ONLY)["paused"])
 
+    def test_pause_by_connection_id(self):
+        # The client sends this shape when the NAS entry, not a task, is selected.
+        text = "\n".join([
+            line(T + "40", PID, "INFO", "daemon-impl.cpp", 2166, "Pause session 1 by connection id."),
+            line(T + "40", PID, "INFO", "daemon-impl.cpp", 2166, "Pause session 2 by connection id."),
+        ])
+        p = syndctl.parse_log(text)
+        self.assertTrue(p["paused"])
+        self.assertEqual(p["paused_sessions"], [1, 2])
+        text += "\n" + line(T + "50", PID, "INFO", "daemon-impl.cpp", 2255, "Resume session 1 by session id.")
+        p = syndctl.parse_log(text)
+        self.assertEqual(p["paused_sessions"], [2])
+
     def test_pause_one_session_only(self):
         one = line(T + "40", PID, "INFO", "daemon-impl.cpp", 2154, "Pause session 2 by session id.")
         p = syndctl.parse_log(one)

@@ -143,6 +143,27 @@ def daemon_pid(conf):
     return _proc_running("cloud-drive-daemon")
 
 
+def tray_status(ui_pid):
+    """The client's own status line from its tray item's tooltip, e.g.
+    'Up-to-date', 'Paused', 'Syncing 3 files' — or None. Read over D-Bus with
+    busctl (systemd), the one non-stdlib helper we allow ourselves because it
+    is always present on Omarchy. A cross-check, never the source of truth."""
+    if not ui_pid or shutil.which("busctl") is None:
+        return None
+    rc, out, _ = _run(["busctl", "--user", "get-property",
+                       f"org.kde.StatusNotifierItem-{ui_pid}-1", "/StatusNotifierItem",
+                       "org.kde.StatusNotifierItem", "ToolTip"], timeout=2)
+    if rc != 0:
+        return None
+    # (sa(iiay)ss) "" 0 "Synology Drive Client 4.0.3\nUp-to-date" ""
+    parts = re.findall(r'"((?:[^"\\]|\\.)*)"', out)
+    if len(parts) < 2:
+        return None
+    text = parts[1].encode().decode("unicode_escape", "ignore")
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    return lines[-1] if len(lines) > 1 else (lines[0] if lines else None)
+
+
 def client_version():
     """'4.0.3-17892' from the app bundle's INFO file, else None."""
     parts = {}
@@ -553,7 +574,9 @@ _EVENT_RE = re.compile(
 _POOL_EMPTY_RE = re.compile(
     r"Syncer event pool is now empty.*session id (\d+)")
 _SET_SYNC_ID_RE = re.compile(r"Set session (\d+)'s sync_id to")
-_PAUSE_SESSION_RE = re.compile(r"^(Pause|Resume) session (\d+) by session id")
+# "by session id" when a task was selected in the client, "by connection id"
+# when the NAS entry was; the daemon does the same thing either way.
+_PAUSE_SESSION_RE = re.compile(r"^(Pause|Resume) session (\d+) by (?:session|connection) id")
 
 _EVENT_KIND = {
     "add": "added", "modify": "modified", "remove": "removed",
@@ -835,6 +858,7 @@ class Client:
             "version": client_version(),
             "daemon_running": bool(dpid),
             "ui_running": bool(upid),
+            "tray_status": tray_status(upid),
             "state": state,
             "paused": live["paused"],
             "paused_sessions": live["paused_sessions"],
@@ -1035,6 +1059,15 @@ def doctor():
         add(daemon_ok(r), "Daemon IPC answers (pause/resume, event counts)",
             f"event_count={r[0].get('event_count')}" if daemon_ok(r) else repr(r),
             "restart the client: synology-drive quit; " + LAUNCHER + " start")
+    if log_ok and upid:
+        # Informational: the client's tray only reflects pauses it made itself,
+        # so after a pause/resume from the bar it lags until its next own action.
+        tray = tray_status(upid)
+        live = parse_log(log_tail(conf))
+        add(True, "Client tray says",
+            f"{tray!r}; daemon log says {'paused' if live['paused'] else 'running'}"
+            + ("" if tray is None or (("Paused" in tray) == live["paused"])
+               else "  (the client's tray does not follow pauses made from the bar)"), "")
     if log_ok:
         live = parse_log(log_tail(conf))
         add(not live["offline"], "NAS reachable (per daemon log)",
@@ -1104,7 +1137,8 @@ def _print_get(st):
     print(f"  state        {st['state']}"
           + (f"  (paused since {_fmt_time(st['paused_since'])})" if st["paused"] else ""))
     print(f"  client       {st['version'] or '-'}  daemon={'up' if st['daemon_running'] else 'down'}"
-          f"  ui={'up' if st['ui_running'] else 'down'}")
+          f"  ui={'up' if st['ui_running'] else 'down'}"
+          + (f"  tray says '{st['tray_status']}'" if st.get('tray_status') else ""))
     if c:
         print(f"  nas          {c['user']}@{c['server']}:{c['port']}"
               f"{' (ssl)' if c['ssl'] else ''}  status={c['status']} error={c['error']}")
