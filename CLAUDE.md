@@ -1,4 +1,4 @@
-# Synology Drive — Omarchy plugin
+# Synology Drive Control, an Omarchy plugin
 
 Synology Drive Client sync status and controls in the bar
 

@@ -3,7 +3,7 @@ Marketplace submission for https://plugins.omarchy.org — unsubmitted draft.
 Before submitting: push the repo and tag, strip this comment, then:
 
   gh issue create --repo HANCORE-linux/omarchy-plugin-marketplace \
-    --title "[Plugin]: Synology Drive" --body-file docs/SUBMISSION-DRAFT.md
+    --title "[Plugin]: Synology Drive Control" --body-file docs/SUBMISSION-DRAFT.md
 
 Categories: Appearance, Desktop, Developer Tools, Hardware, Productivity,
 System, Widgets, Other. Tags (1-3): AI, Bar, Games, Hyprland, Launcher,

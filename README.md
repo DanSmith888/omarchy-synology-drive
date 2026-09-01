@@ -1,4 +1,4 @@
-# Synology Drive
+# Synology Drive Control
 
 Synology Drive Client status in the [Omarchy](https://omarchy.org/) bar:
 what is syncing, what failed, the sync log, pause and resume. No Qt tray icon.
