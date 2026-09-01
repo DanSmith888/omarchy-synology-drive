@@ -416,6 +416,7 @@ _EVENT_RE = re.compile(
 _POOL_EMPTY_RE = re.compile(
     r"Syncer event pool is now empty.*session id (\d+)")
 _SET_SYNC_ID_RE = re.compile(r"Set session (\d+)'s sync_id to")
+_PAUSE_SESSION_RE = re.compile(r"^(Pause|Resume) session (\d+) by session id")
 
 _EVENT_KIND = {
     "add": "added", "modify": "modified", "remove": "removed",
@@ -480,7 +481,7 @@ def parse_log(text):
     """
     pending = {}            # (session, path) -> item
     idle_at = {}            # session -> ts of last "pool empty"
-    paused = False
+    paused_sessions = {}    # session -> True while paused
     pause_ts = None
     last_fail = None        # ts of last "Failed to establish a new channel"
     last_ok = None          # ts of last sign the NAS answered
@@ -502,7 +503,7 @@ def parse_log(text):
         if pid != last_pid:
             if last_pid is not None:
                 pending.clear()
-                paused = False
+                paused_sessions.clear()
             last_pid = pid
 
         if src == "event-manager.cpp":
@@ -548,11 +549,16 @@ def parse_log(text):
                 last_ok = ts
             continue
 
-        if src == "worker_mgr.cpp":
-            if "pause all worker" in msg:
-                paused, pause_ts = True, ts
-            elif "resume all worker" in msg:
-                paused, pause_ts = False, ts
+        # The real pause markers. "WorkerManager: pause/resume all worker" is
+        # barrier housekeeping that fires on every session reload as well, so
+        # it is deliberately ignored. Pause is per session and not persisted
+        # anywhere on disk; a daemon restart un-pauses (handled by the pid
+        # reset above).
+        if src == "daemon-impl.cpp":
+            m2 = _PAUSE_SESSION_RE.search(msg)
+            if m2:
+                paused_sessions[int(m2.group(2))] = m2.group(1) == "Pause"
+                pause_ts = ts
             continue
 
         if src == "pullevent-handler.cpp" and _SET_SYNC_ID_RE.search(msg):
@@ -567,6 +573,7 @@ def parse_log(text):
             last_error = {"time": ts, "text": msg[:160]}
 
     offline = last_fail is not None and (last_ok is None or last_fail > last_ok)
+    paused = any(paused_sessions.values())
     queue = sorted(pending.values(), key=lambda i: (not i.get("started"), i["since"] or 0))
     current = None
     started = [i for i in queue if i.get("started")]
@@ -576,6 +583,7 @@ def parse_log(text):
         "queue": queue,
         "current": current,
         "paused": paused,
+        "paused_sessions": sorted(k for k, v in paused_sessions.items() if v),
         "paused_since": pause_ts if paused else None,
         "offline": offline,
         "offline_since": last_fail if offline else None,
@@ -651,7 +659,7 @@ class Client:
                 s["state"] = "stopped"
             elif s["error"]:
                 s["state"] = "error"
-            elif live["paused"]:
+            elif s["id"] in live["paused_sessions"]:
                 s["state"] = "paused"
             elif live["offline"]:
                 s["state"] = "offline"

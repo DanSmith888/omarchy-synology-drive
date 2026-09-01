@@ -70,11 +70,29 @@ LOCAL_MODIFY = "\n".join([
          "PullEvent: " + ev("FileModifyEvent", 1, "local", "file", "/notes/todo.md", 0, 0)),
 ])
 
+# Real shape of the native Pause button (client 4.0.3, observed 2026-09-01):
+# per-session markers, followed by barrier chatter that also fires on plain
+# session reloads and therefore must not be read as pause/resume.
 PAUSE = "\n".join([
-    line(T + "40", PID, "INFO", "barrier.cpp", 50, "Worker (0): Reach barrier."),
+    line(T + "40", PID, "INFO", "daemon-impl.cpp", 2154, "Pause session 1 by session id."),
+    line(T + "40", PID, "INFO", "daemon-impl.cpp", 2154, "Pause session 2 by session id."),
     line(T + "40", PID, "INFO", "worker_mgr.cpp", 84, "WorkerManager: pause all worker"),
+    line(T + "40", PID, "INFO", "daemon-impl.cpp", 1352, "remove 1 worker process"),
+    line(T + "40", PID, "INFO", "worker_mgr.cpp", 109, "WorkerManager: resume all worker"),
 ])
-RESUME = line(T + "50", PID, "INFO", "worker_mgr.cpp", 109, "WorkerManager: resume all worker")
+RESUME = "\n".join([
+    line(T + "50", PID, "INFO", "daemon-impl.cpp", 2255, "Resume session 1 by session id."),
+    line(T + "50", PID, "INFO", "daemon-impl.cpp", 2255, "Resume session 2 by session id."),
+    line(T + "50", PID, "INFO", "worker_mgr.cpp", 84, "WorkerManager: pause all worker"),
+    line(T + "50", PID, "INFO", "daemon-impl.cpp", 1374, "add 1 worker process"),
+    line(T + "50", PID, "INFO", "worker_mgr.cpp", 109, "WorkerManager: resume all worker"),
+])
+RELOAD_ONLY = "\n".join([
+    line(T + "45", PID, "INFO", "daemon-impl.cpp", 2046, "Action 'reload_session': Reloading session #2, info={\"action\": \"reload_session\"}"),
+    line(T + "45", PID, "INFO", "worker_mgr.cpp", 84, "WorkerManager: pause all worker"),
+    line(T + "45", PID, "INFO", "daemon-impl.cpp", 1352, "remove 2 worker process"),
+    line(T + "45", PID, "INFO", "worker_mgr.cpp", 109, "WorkerManager: resume all worker"),
+])
 
 OFFLINE = "\n".join([
     line(T + "55", PID, "INFO", "protocol-client.cpp", 135,
@@ -119,8 +137,19 @@ class ParseLog(unittest.TestCase):
         self.assertEqual(s["current"]["session"], 1)
 
     def test_pause_and_resume_markers(self):
-        self.assertTrue(syndctl.parse_log(PAUSE)["paused"])
+        p = syndctl.parse_log(PAUSE)
+        self.assertTrue(p["paused"])
+        self.assertEqual(p["paused_sessions"], [1, 2])
         self.assertFalse(syndctl.parse_log(PAUSE + "\n" + RESUME)["paused"])
+
+    def test_reload_is_not_a_pause(self):
+        self.assertFalse(syndctl.parse_log(RELOAD_ONLY)["paused"])
+
+    def test_pause_one_session_only(self):
+        one = line(T + "40", PID, "INFO", "daemon-impl.cpp", 2154, "Pause session 2 by session id.")
+        p = syndctl.parse_log(one)
+        self.assertTrue(p["paused"])
+        self.assertEqual(p["paused_sessions"], [2])
 
     def test_offline_until_next_success(self):
         self.assertTrue(syndctl.parse_log(DOWNLOAD_DONE + "\n" + OFFLINE)["offline"])
