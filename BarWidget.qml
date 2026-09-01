@@ -1,6 +1,5 @@
 import QtQuick
 import Quickshell.Io
-import qs.Commons
 import qs.Ui
 
 // Synology Drive: the pill in the bar, and the host for the panel.
@@ -110,20 +109,9 @@ BarWidget {
     }
   }
 
-  // Reserve the width the pill has actually needed in its current state, so
-  // a count going 9 -> 12 -> 3 never shoves the neighbours; reset when the
-  // state changes, because a "Paused" reserve would otherwise leave a hole
-  // beside the bare glyph for the rest of the session.
-  property real reservedWidth: 0
-  onSyncStateChanged: reservedWidth = 0
-
-  TextMetrics {
-    id: pillMetrics
-    font.family: root.bar ? root.bar.fontFamily : Style.font.family
-    font.pixelSize: Style.font.body
-    text: root.pillText
-    onWidthChanged: if (width > root.reservedWidth) root.reservedWidth = width
-  }
+  // No width reserve here on purpose (Daniel, 2026-09-01): the text only
+  // changes with the sync state, not on every poll, so the house rule for
+  // fast-changing pills does not apply and a reserve would just add slack.
 
   // WidgetButton, not BarIconButton: the latter is glyph-only and clips text.
   WidgetButton {
@@ -132,13 +120,7 @@ BarWidget {
     bar: root.bar
     text: root.pillText
     hasVisualContent: text !== ""
-    // WidgetButton centres its label, so slack sits either side and the
-    // neighbours never move. pillMetrics stays in the max so a reading can
-    // never be clipped by a stale reserve.
-    fixedWidth: pillMetrics.width > 0
-      ? Math.max(root.reservedWidth, pillMetrics.width, labelWidth) + scaledHorizontalMargin * 2
-      : -1
-    horizontalMargin: 5
+    horizontalMargin: 8.75
     verticalPadding: 8.75
     active: root.syncState === "error"
     tooltipText: {
