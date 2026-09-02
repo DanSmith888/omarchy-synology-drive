@@ -97,39 +97,48 @@ def reap(proc, grace=KILL_GRACE):
     """Signal the child's whole group and return only once the group is gone.
 
     The direct child exiting is not enough: descendants share its group and
-    outlive it happily, so keep signalling until killpg says the group is
-    empty.
+    outlive it happily. Group signalling stays safe through every phase
+    because of a kernel invariant: a pid is never reused while it is still
+    some process's live process-group id. So:
+
+    - leader unreaped (poll() is None): the pid itself is pinned; killpg is
+      safe (start-time cross-check kept as belt and braces).
+    - leader reaped but the group non-empty: the surviving members pin the
+      pgid, so it still names our group; killpg the members.
+    - group empty: nothing may be signalled; the id is free for reuse.
+
+    The leader is reaped non-blockingly inside the drain loop: a zombie
+    leader would otherwise pin the group forever.
     """
     pgid = proc.pid                 # setsid in the child makes pid == pgid
     for sig in (signal.SIGTERM, signal.SIGKILL):
-        if not _group_alive(pgid) and proc.poll() is not None:
+        proc.poll()
+        leader_alive = proc.returncode is None
+        if not leader_alive and not _group_alive(pgid):
             break
-        # Never signal a numeric pgid blind: after the leader is reaped the
-        # id can be reused by an unrelated process. killpg only while the
-        # leader's recorded start time still matches; once it does not, fall
-        # back to the leader's pidfd (race-free by construction) and stop
-        # touching the group id.
-        if (proc.poll() is None
-                and getattr(proc, "_pr_start", None) is not None
-                and _start_time(proc.pid) == proc._pr_start):
+        if leader_alive and getattr(proc, "_pr_start", None) is not None \
+                and _start_time(proc.pid) != proc._pr_start:
+            # Cannot happen for an unreaped child of ours; treat a mismatch
+            # as corruption and take the race-free leader-only path.
+            with contextlib.suppress(OSError):
+                if getattr(proc, "_pr_pidfd", None) is not None:
+                    signal.pidfd_send_signal(proc._pr_pidfd, sig)
+        else:
             try:
                 os.killpg(pgid, sig)
             except OSError:
-                pass
-        elif proc.poll() is None and getattr(proc, "_pr_pidfd", None) is not None:
-            with contextlib.suppress(OSError):
-                signal.pidfd_send_signal(proc._pr_pidfd, sig)
+                if leader_alive:
+                    with contextlib.suppress(OSError):
+                        proc.send_signal(sig)
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            proc.poll()             # reap the leader; a zombie pins the pgid
+            if proc.returncode is not None and not _group_alive(pgid):
+                break
+            time.sleep(0.05)
         else:
-            break
-        try:
-            proc.wait(timeout=grace)
-        except subprocess.TimeoutExpired:
             continue
-        if not _group_alive(pgid):
-            break
-    if proc.poll() is None:
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=grace)
+        break
     fd = getattr(proc, "_pr_pidfd", None)
     if fd is not None:
         proc._pr_pidfd = None
@@ -276,10 +285,12 @@ def run_bounded(cmd, timeout=6, max_output=MAX_OUTPUT, env=None):
                     sel.unregister(key.fileobj)
                     continue
                 buf = bufs[key.fileobj]
-                room = max_output - len(buf)
-                if room > 0:
-                    buf += chunk[:room]
-                else:
+                take = chunk[:max(0, max_output - len(buf))]
+                buf += take
+                if len(take) < len(chunk):
+                    # Any byte dropped means the producer said more than the
+                    # bound: the capture is incomplete and must not be
+                    # parsed as a valid response.
                     overflowed = True
             if overflowed:
                 break
@@ -288,15 +299,22 @@ def run_bounded(cmd, timeout=6, max_output=MAX_OUTPUT, env=None):
 
     if overflowed:
         reap(proc)
-    else:
-        try:
-            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            reap(proc)
-            return 1, "", "timed out"
+        for stream in (proc.stdout, proc.stderr):
+            with contextlib.suppress(OSError):
+                stream.close()
+        return 1, "", "output overflow"
+    try:
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        reap(proc)
+        return 1, "", "timed out"
     for stream in (proc.stdout, proc.stderr):
         with contextlib.suppress(OSError):
             stream.close()
+    # A leader may exit cleanly the instant after forking a background
+    # child; the group must be swept before the Popen is forgotten.
+    if _group_alive(proc.pid):
+        reap(proc)
     _ACTIVE.discard(proc)
 
     def dec(b):
