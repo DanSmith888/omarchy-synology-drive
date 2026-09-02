@@ -63,82 +63,80 @@ def _child_setup(parent_pid):
         os._exit(1)
 
 
-def _group_alive(pgid):
+def _live_members(pgid):
+    """How many live (non-zombie) processes have `pgid` as their process
+    group, by /proc scan.
+
+    Never inferred from killpg(pgid, 0): that also counts zombies and says
+    nothing about whose group it is. This count is only meaningful while the
+    group id is pinned, which the caller guarantees by holding its leader
+    unreaped for the whole time.
+    """
+    count = 0
     try:
-        os.killpg(pgid, 0)
-        return True
+        entries = os.listdir("/proc")
     except OSError:
-        return False
+        return 0
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "rb") as handle:
+                data = handle.read(1024)
+            tail = data.rsplit(b") ", 1)[1].split()
+            state, member_pgid = tail[0], int(tail[2])
+        except (OSError, IndexError, ValueError):
+            continue
+        if member_pgid == pgid and state not in (b"Z", b"X"):
+            count += 1
+    return count
 
 
-def _start_time(pid):
-    """The kernel's start-time ticks for `pid`, or None. Together with the
-    pid this identifies one specific process incarnation: a reused pid gets
-    a different start time."""
+def _leader_exited(proc):
+    """True when the leader has exited, WITHOUT reaping it.
+
+    waitid(WNOWAIT) peeks at the exit status and leaves the child a zombie,
+    so its pid — and therefore the group id — stays pinned.
+    """
+    if proc.returncode is not None:
+        return True
     try:
-        with open(f"/proc/{pid}/stat", "rb") as handle:
-            data = handle.read(4096)
-        return data.rsplit(b") ", 1)[1].split()[19]
-    except (OSError, IndexError):
-        return None
+        return os.waitid(os.P_PID, proc.pid,
+                         os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except (ChildProcessError, OSError):
+        return True
 
 
 def remember_identity(proc):
-    """Record the child leader's (pidfd, start time) right after spawn, so a
-    later reap can prove the pgid still names our child before signalling."""
-    try:
-        proc._pr_pidfd = os.pidfd_open(proc.pid)
-    except OSError:
-        proc._pr_pidfd = None
-    proc._pr_start = _start_time(proc.pid)
+    """Kept for API stability; identity now comes from holding the leader
+    unreaped through the whole escalation, not from recorded state."""
+    proc._pr_pidfd = None
 
 
 def reap(proc, grace=KILL_GRACE):
-    """Signal the child's whole group and return only once the group is gone.
+    """End the child's whole group, then reap the leader — in that order.
 
-    The direct child exiting is not enough: descendants share its group and
-    outlive it happily. Group signalling stays safe through every phase
-    because of a kernel invariant: a pid is never reused while it is still
-    some process's live process-group id. So:
-
-    - leader unreaped (poll() is None): the pid itself is pinned; killpg is
-      safe (start-time cross-check kept as belt and braces).
-    - leader reaped but the group non-empty: the surviving members pin the
-      pgid, so it still names our group; killpg the members.
-    - group empty: nothing may be signalled; the id is free for reuse.
-
-    The leader is reaped non-blockingly inside the drain loop: a zombie
-    leader would otherwise pin the group forever.
+    The pid-reuse race is closed structurally: the leader is our unreaped
+    child for the entire TERM-to-KILL escalation, so the kernel cannot hand
+    its pid (== the pgid) to anyone else while signals are being sent. Only
+    when no live member remains is the leader finally reaped. If a caller
+    has already reaped the leader, nothing is signalled at all: without the
+    pin, a numeric pgid proves nothing.
     """
     pgid = proc.pid                 # setsid in the child makes pid == pgid
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        proc.poll()
-        leader_alive = proc.returncode is None
-        if not leader_alive and not _group_alive(pgid):
-            break
-        if leader_alive and getattr(proc, "_pr_start", None) is not None \
-                and _start_time(proc.pid) != proc._pr_start:
-            # Cannot happen for an unreaped child of ours; treat a mismatch
-            # as corruption and take the race-free leader-only path.
-            with contextlib.suppress(OSError):
-                if getattr(proc, "_pr_pidfd", None) is not None:
-                    signal.pidfd_send_signal(proc._pr_pidfd, sig)
-        else:
-            try:
-                os.killpg(pgid, sig)
-            except OSError:
-                if leader_alive:
-                    with contextlib.suppress(OSError):
-                        proc.send_signal(sig)
-        deadline = time.monotonic() + grace
-        while time.monotonic() < deadline:
-            proc.poll()             # reap the leader; a zombie pins the pgid
-            if proc.returncode is not None and not _group_alive(pgid):
+    if proc.returncode is None:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            if _live_members(pgid) == 0:
                 break
-            time.sleep(0.05)
-        else:
-            continue
-        break
+            with contextlib.suppress(OSError):
+                os.killpg(pgid, sig)
+            deadline = time.monotonic() + grace
+            while time.monotonic() < deadline:
+                if _live_members(pgid) == 0:
+                    break
+                time.sleep(0.05)
+    with contextlib.suppress(Exception):
+        proc.wait(timeout=grace)
     fd = getattr(proc, "_pr_pidfd", None)
     if fd is not None:
         proc._pr_pidfd = None
@@ -297,25 +295,22 @@ def run_bounded(cmd, timeout=6, max_output=MAX_OUTPUT, env=None):
     finally:
         sel.close()
 
-    if overflowed:
-        reap(proc)
-        for stream in (proc.stdout, proc.stderr):
-            with contextlib.suppress(OSError):
-                stream.close()
-        return 1, "", "output overflow"
-    try:
-        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
-    except subprocess.TimeoutExpired:
-        reap(proc)
-        return 1, "", "timed out"
     for stream in (proc.stdout, proc.stderr):
         with contextlib.suppress(OSError):
             stream.close()
-    # A leader may exit cleanly the instant after forking a background
-    # child; the group must be swept before the Popen is forgotten.
-    if _group_alive(proc.pid):
+    if overflowed:
         reap(proc)
-    _ACTIVE.discard(proc)
+        return 1, "", "output overflow"
+    # Wait for the leader to exit WITHOUT reaping it (waitid WNOWAIT): its
+    # zombie pins the group id, so the descendant sweep below can never
+    # signal a recycled group. reap() does the sweep first and only then
+    # reaps the leader.
+    while not _leader_exited(proc):
+        if time.monotonic() >= deadline:
+            reap(proc)
+            return 1, "", "timed out"
+        time.sleep(0.02)
+    reap(proc)
 
     def dec(b):
         return bytes(b).decode("utf-8", "replace")
