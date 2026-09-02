@@ -27,16 +27,16 @@ the same request the client's own Pause button sends — not the launcher's
 
 import argparse
 import fcntl
+import importlib.machinery
+import importlib.util
 import glob
 import json
 import os
 import re
-import shutil
 import signal
 import socket
 import sqlite3
 import struct
-import subprocess
 import sys
 import time
 import stat
@@ -84,6 +84,25 @@ LOCK_TIMEOUT = 8.0
 TIMEOUT = 10
 SELF_DEADLINE = 25          # SIGALRM: no invocation may outlive this
 
+sys.dont_write_bytecode = True
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _runtime():
+    """Load bin/plugin_runtime.py by path, not by sys.path search.
+
+    An entry earlier on sys.path could otherwise shadow the module name.
+    """
+    path = os.path.join(_HERE, "plugin_runtime.py")
+    loader = importlib.machinery.SourceFileLoader("plugin_runtime", path)
+    spec = importlib.util.spec_from_loader("plugin_runtime", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+rt = _runtime()
+
 DRIVE_DIR = os.path.expanduser("~/.SynologyDrive")
 # Every Synology-controlled path (client.conf can redirect db/log/socket
 # paths) is accepted only after resolving inside this root; anything else
@@ -93,6 +112,8 @@ DRIVE_DIR = os.path.expanduser("~/.SynologyDrive")
 DRIVE_ROOT = os.path.realpath(DRIVE_DIR)
 CLIENT_CONF = os.path.join(DRIVE_DIR, "data", "config", "client.conf")
 LAUNCHER = "synology-drive"
+# The peer we expect on the daemon socket; also matched by _proc_running.
+DAEMON_PROCESS = "cloud-drive-daemon"
 
 MAX_TEXT_BYTES = 256 * 1024      # any single confined text read
 MAX_DB_BYTES = 1 << 30           # sanity ceiling on a database file
@@ -122,9 +143,60 @@ def confined(path, fallback):
     return os.path.realpath(fallback)
 
 
+def walk_confined(path):
+    """(dir_fd, leaf) for a confined path, walked one component at a time.
+
+    confined() resolves a name and hands back a string; reopening that string
+    later is a different operation on a possibly different file. O_NOFOLLOW
+    guards only the final component, so swapping a *parent* directory for a
+    symlink after the check redirects the open and nothing raises.
+
+    That matters here because DRIVE_ROOT is not ordinary local storage: its
+    contents arrive from the NAS, so directory entries under it are
+    attacker-influenced input rather than something only we create.
+
+    Descriptors bind to inodes, not names, so each component is opened
+    relative to the descriptor of its validated parent and re-pointing a name
+    mid-walk cannot redirect the walk. The caller closes dir_fd.
+    """
+    rel = os.path.relpath(path, DRIVE_ROOT)
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        raise OSError(f"{path} is outside {DRIVE_ROOT}")
+    parts = [p for p in rel.split(os.sep) if p not in ("", os.curdir)]
+    if not parts:
+        raise OSError(f"{path} is the root itself, not a file in it")
+
+    # The anchor is opened by name: it is the trust root, and is realpath'd
+    # once at import. Everything below it is descriptor-relative.
+    dir_fd = os.open(DRIVE_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        if os.fstat(dir_fd).st_uid != os.getuid():
+            raise OSError(f"{DRIVE_ROOT} is not owned by this user")
+        for part in parts[:-1]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                          | os.O_CLOEXEC, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = nxt
+            if os.fstat(dir_fd).st_uid != os.getuid():
+                raise OSError(f"{part} is not owned by this user")
+        return dir_fd, parts[-1]
+    except Exception:
+        os.close(dir_fd)
+        raise
+
+
 def open_confined(path):
-    """O_NOFOLLOW descriptor for a regular file we own, already confined."""
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    """O_NOFOLLOW descriptor for a regular file we own, already confined.
+
+    The parent chain is traversed on descriptors, so only the inode that was
+    validated can be opened.
+    """
+    dir_fd, leaf = walk_confined(path)
+    try:
+        fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
@@ -180,38 +252,20 @@ FILTERED_REASONS = {-8192}
 
 
 def _run(cmd, timeout=TIMEOUT, env=None):
-    """(rc, stdout, stderr); rc -1 on timeout/missing binary. Never raises.
+    """(rc, stdout, stderr); rc non-zero on timeout or a missing binary.
 
-    The child gets its own session so a timeout kills the whole process
-    group (TERM, then KILL); captured output is capped.
+    Delegates to plugin_runtime, which drains both pipes concurrently against
+    a byte ceiling enforced *while* reading, and enforces the deadline during
+    the read. communicate() was not enough: it reads to EOF before the timeout
+    applies, so MAX_RUN_OUTPUT only trimmed output that had already been
+    allocated in full. Overflow or timeout kills the child's whole process
+    group, so helpers spawned in turn do not outlive the call.
+
+    cmd[0] is a bare program name, resolved against root-owned system
+    directories rather than PATH; see plugin_runtime.open_trusted_exec.
     """
-    proc = None
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, env=env,
-                                start_new_session=True)
-        try:
-            out, err = proc.communicate(timeout=timeout)
-            rc = proc.returncode
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-                proc.wait(timeout=1)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                proc.wait(timeout=1)
-            return -1, "", "timeout"
-        return rc, (out or "")[:MAX_RUN_OUTPUT], (err or "")[:MAX_RUN_OUTPUT]
-    except Exception as exc:
-        if proc is not None:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except Exception:
-                pass
-        return -1, "", str(exc)
+    return rt.run_bounded(cmd, timeout=timeout,
+                          max_output=MAX_RUN_OUTPUT, env=env)
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +326,7 @@ def tray_status(ui_pid):
     'Up-to-date', 'Paused', 'Syncing 3 files' — or None. Read over D-Bus with
     busctl (systemd), the one non-stdlib helper we allow ourselves because it
     is always present on Omarchy. A cross-check, never the source of truth."""
-    if not ui_pid or shutil.which("busctl") is None:
+    if not ui_pid or not rt.have_trusted("busctl"):
         return None
     rc, out, _ = _run(["busctl", "--user", "get-property",
                        f"org.kde.StatusNotifierItem-{ui_pid}-1", "/StatusNotifierItem",
@@ -309,26 +363,40 @@ def client_version():
 def _db(path):
     """Read-only connection to a confined, validated database, or None.
 
-    The file is first opened O_NOFOLLOW and checked (regular, ours, sane
-    size); sqlite then opens the same *name* with mode=ro, and the name is
-    re-checked against the validated descriptor's (dev, inode) so it still
-    binds to what was inspected. WAL/SHM sidecars are derived from that name
-    and therefore stay inside DRIVE_ROOT with it; a descriptor-only open is
-    not possible for a live WAL database.
+    SQLite cannot be handed a descriptor: in WAL mode it derives -wal and -shm
+    sidecars from the pathname and needs the containing directory, so a
+    descriptor-only open is not possible for a live database.
+
+    So the parent chain is walked on descriptors (walk_confined) and sqlite is
+    pointed at that held directory through /proc/self/fd. The path it opens is
+    rooted in the inode we validated rather than in a name that could have
+    been re-pointed since, and the sidecars land in that same directory. Only
+    the final component is still opened by name, so its (dev, inode) is
+    re-checked against the descriptor we inspected: prevention for the
+    parents, detection for the leaf.
     """
     if not path:
         return None
     try:
-        fd = open_confined(path)
+        dir_fd, leaf = walk_confined(path)
     except OSError:
         return None
     try:
+        fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     dir_fd=dir_fd)
+    except OSError:
+        os.close(dir_fd)
+        return None
+    try:
         st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            return None
         if st.st_size > MAX_DB_BYTES:
             return None
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+        bound = os.path.join(f"/proc/self/fd/{dir_fd}", leaf)
+        con = sqlite3.connect(f"file:{bound}?mode=ro", uri=True, timeout=1.0)
         try:
-            now = os.stat(path)
+            now = os.stat(bound)
             if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
                 con.close()
                 return None
@@ -342,6 +410,7 @@ def _db(path):
         return None
     finally:
         os.close(fd)
+        os.close(dir_fd)
 
 
 def _sys_db(conf):
@@ -674,39 +743,81 @@ def ps_decode(buf, i=0, depth=0):
     raise ValueError(f"PStream: unknown tag 0x{tag:02x} at offset {i}")
 
 
+def _peer_is_ours(sock):
+    """True when the process on the other end of `sock` runs as us.
+
+    SO_PEERCRED is recorded by the kernel at connect time and cannot be forged
+    by the peer, so it answers "who is actually there" rather than "what did
+    the directory entry look like a moment ago". The uid check is the
+    load-bearing one: a socket planted by another user cannot pass it. The
+    executable name is a secondary check, skipped when /proc does not answer,
+    since a daemon that exited between connect and check should read as "not
+    running" rather than as an attack.
+    """
+    try:
+        raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                              struct.calcsize("3i"))
+        pid, uid, _gid = struct.unpack("3i", raw)
+    except (OSError, struct.error):
+        return False
+    if uid != os.getuid():
+        return False
+    try:
+        exe = os.path.basename(os.readlink(f"/proc/{pid}/exe"))
+    except OSError:
+        return True
+    return exe in (DAEMON_PROCESS, LAUNCHER)
+
+
 def daemon_call(conf, request, timeout=IPC_TIMEOUT):
     """Send one request map to the daemon, return the list of reply objects.
 
-    None when the socket is absent or refuses (daemon not running). The
-    socket path is confined to DRIVE_ROOT and must be a socket we own; the
-    reply is capped at MAX_IPC_REPLY bytes and MAX_IPC_OBJECTS objects.
+    None when the socket is absent or refuses (daemon not running).
+
+    Trust comes from the connected peer, not from the path. lstat'ing a name
+    and then connecting to it checks one object and uses another: the entry
+    can be replaced in between, and the reply is then parsed as if the daemon
+    had sent it. So the parent chain is walked on descriptors, the connect
+    goes through /proc/self/fd to that held directory, and the peer is
+    authenticated with SO_PEERCRED once connected.
+
+    The reply is capped at MAX_IPC_REPLY bytes and MAX_IPC_OBJECTS objects.
     """
     path = confined(conf.get("socket_path"), os.path.join(DRIVE_DIR, "daemon.sock"))
     try:
-        st = os.lstat(path)
-        if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
-            return None
+        dir_fd, leaf = walk_confined(path)
     except OSError:
         return None
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
     data = b""
     try:
-        sock.connect(path)
-        sock.sendall(ps_encode(request))
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and len(data) <= MAX_IPC_REPLY:
-            try:
-                chunk = sock.recv(65536)
-            except socket.timeout:
-                break
-            if not chunk:
-                break
-            data += chunk
-    except OSError:
-        return None
+        try:
+            st = os.lstat(leaf, dir_fd=dir_fd)
+            if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+                return None
+        except OSError:
+            return None
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(os.path.join(f"/proc/self/fd/{dir_fd}", leaf))
+            if not _peer_is_ours(sock):
+                return None
+            sock.sendall(ps_encode(request))
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline and len(data) <= MAX_IPC_REPLY:
+                try:
+                    chunk = sock.recv(65536)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                data += chunk
+        except OSError:
+            return None
+        finally:
+            sock.close()
     finally:
-        sock.close()
+        os.close(dir_fd)
     if len(data) > MAX_IPC_REPLY:
         return None
     out, i = [], 0
@@ -1099,8 +1210,8 @@ class Client:
         instance is running the launcher would start one instead, which is
         wanted for `show` and surprising for `pause`.
         """
-        if shutil.which(LAUNCHER) is None:
-            raise SystemExit(f"syndctl: {LAUNCHER} not on PATH — is synology-drive-client installed?")
+        if not rt.have_trusted(LAUNCHER):
+            raise SystemExit(f"syndctl: {LAUNCHER} not found in a trusted system directory; is synology-drive-client installed?")
         if require_running and not _proc_running("cloud-drive-ui"):
             raise SystemExit("syndctl: Synology Drive Client is not running (start it with: syndctl show)")
         rc, _, err = _run([LAUNCHER, verb], timeout=25, env=self._client_env())
@@ -1179,14 +1290,16 @@ class Client:
         """Select `path` in the file manager (Nautilus), else open its folder."""
         if not path or not os.path.lexists(path):
             raise SystemExit(f"syndctl: no such file: {path}")
-        if shutil.which("nautilus"):
+        if rt.have_trusted("nautilus"):
             cmd = ["nautilus", "--select", path]
-            if shutil.which("uwsm-app"):
+            if rt.have_trusted("uwsm-app"):
                 cmd = ["uwsm-app", "--"] + cmd
         else:
             cmd = ["xdg-open", path if os.path.isdir(path) else os.path.dirname(path)]
-        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            rt.spawn_trusted(cmd)
+        except OSError as exc:
+            raise SystemExit(f"syndctl: {exc}")
         return path
 
     def open(self, session_id=None):
@@ -1200,9 +1313,10 @@ class Client:
             folder = sess[0]["folder"]
         if not folder or not os.path.isdir(folder):
             raise SystemExit(f"syndctl: no sync folder for session {session_id}")
-        subprocess.Popen(["xdg-open", folder], stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+        try:
+            rt.spawn_trusted(["xdg-open", folder])
+        except OSError as exc:
+            raise SystemExit(f"syndctl: {exc}")
         return folder
 
 
@@ -1231,8 +1345,12 @@ def doctor():
     add(bool(upid), "Client UI running (tray + settings window)",
         f"cloud-drive-ui pid {upid}" if upid else "",
         f"QT_QPA_PLATFORM=xcb {LAUNCHER} start")
-    add(shutil.which(LAUNCHER) is not None, "synology-drive launcher on PATH",
-        shutil.which(LAUNCHER) or "", "install the client package")
+    _launcher_fd, _launcher_path = rt.open_trusted_exec(LAUNCHER)
+    if _launcher_fd is not None:
+        os.close(_launcher_fd)
+    add(_launcher_path is not None,
+        "synology-drive launcher in a trusted system directory",
+        _launcher_path or "", "install the client package")
 
     # 2. its data
     conn = connection(conf) if conf else None
@@ -1362,7 +1480,20 @@ def _print_get(st):
         print(f"  skipped      {st['skipped_count']} excluded by filter")
 
 
+def _on_alarm(signum, _frame):
+    """The backstop must still take our children with us.
+
+    SIGALRM's default action terminates the process immediately, which
+    bypasses the atexit reaper and leaves any helper we started running.
+    """
+    rt.reap_all()
+    os._exit(1)
+
+
 def main():
+    # Own every child on every exit path, including the backstop below.
+    rt.install_teardown()
+    signal.signal(signal.SIGALRM, _on_alarm)
     # Hard backstop: no invocation may outlive this, whatever wedges. The
     # widget's own deadline is shorter; this catches everything else.
     signal.alarm(SELF_DEADLINE)

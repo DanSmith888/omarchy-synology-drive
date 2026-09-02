@@ -13,15 +13,35 @@ All the work is in bin/syndctl; this only decides whether there is anything
 to show. Standard library only. No root, no network.
 """
 
+import importlib.machinery
+import importlib.util
 import json
 import os
-import signal
-import subprocess
 import re
-import select
-import time
+import signal
+import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Importing a sibling would otherwise litter the plugin folder with
+# __pycache__; the plugin dir stays exactly as installed.
+sys.dont_write_bytecode = True
+
+
+def _runtime():
+    """Load bin/plugin_runtime.py by path, not by sys.path search.
+
+    An entry earlier on sys.path could otherwise shadow the module name.
+    """
+    path = os.path.join(HERE, "plugin_runtime.py")
+    loader = importlib.machinery.SourceFileLoader("plugin_runtime", path)
+    spec = importlib.util.spec_from_loader("plugin_runtime", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+rt = _runtime()
 CLIENT_CONF = os.path.expanduser("~/.SynologyDrive/data/config/client.conf")
 TIMEOUT = 10
 
@@ -64,51 +84,31 @@ def scrub(value):
 def run(cmd, timeout=TIMEOUT, limit=MAX_OUTPUT):
     """stdout on success, None on any failure. Never raises, never hangs.
 
-    Reads at most `limit` bytes and enforces `timeout` across the whole read,
-    not just around process exit: a command that produces nothing and never
-    exits would otherwise block for as long as it liked.
+    Delegates to plugin_runtime, which caps each stream while reading,
+    enforces the deadline during the read rather than only around exit, and
+    reaps the child's whole process group. Killing the direct child is not
+    enough here: syndctl spawns helpers of its own, and those share its group
+    and outlive it, so a cancelled poll used to leave work running.
     """
-    proc = None
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL)
-        fd = proc.stdout.fileno()
-        deadline = time.monotonic() + timeout
-        chunks, total, truncated = [], 0, False
-        while total < limit:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            if not select.select([fd], [], [], remaining)[0]:
-                break
-            chunk = os.read(fd, min(65536, limit - total))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-        else:
-            truncated = True
-        proc.stdout.close()
-        try:
-            rc = proc.wait(timeout=0.5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=1)
-            rc = None
-        if not chunks:
-            return None
-        if rc == 0 or truncated:
-            return b"".join(chunks).decode("utf-8", "replace")
-        return None
-    except Exception:
-        if proc is not None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        return None
+    rc, out, _ = rt.run_bounded(cmd, timeout=timeout, max_output=limit)
+    return out or None
+
+
+def _on_alarm(signum, _frame):
+    """The backstop must still take our children with us.
+
+    SIGALRM's default action terminates the process immediately, which
+    bypasses the atexit reaper and orphans anything still running.
+    """
+    rt.reap_all()
+    print("{}", flush=True)
+    os._exit(0)
+
 
 def main():
+    # Own every child on every exit path, including the backstop below.
+    rt.install_teardown()
+    signal.signal(signal.SIGALRM, _on_alarm)
     # Hard backstop: this probe may never outlive the widget's deadline.
     signal.alarm(28)
     if not os.path.isfile(CLIENT_CONF):
@@ -116,7 +116,10 @@ def main():
         return
 
     state = {"present": True, "state": None}
-    out = run([os.path.join(HERE, "syndctl"), "get", "--json"])
+    # Run through the trusted interpreter rather than exec'ing the script
+    # directly: cmd[0] is resolved against root-owned system directories and
+    # the exec is bound to that descriptor.
+    out = run(["python3", os.path.join(HERE, "syndctl"), "get", "--json"])
     if out:
         try:
             d = json.loads(out)
