@@ -222,6 +222,33 @@ class PStream(unittest.TestCase):
         with self.assertRaises(ValueError):
             syndctl.ps_decode(b"{")
 
+    def test_depth_bomb_rejected(self):
+        bomb = b"\x41" * (syndctl.MAX_PS_DEPTH + 2) + b"\x40" * (syndctl.MAX_PS_DEPTH + 2)
+        with self.assertRaises(ValueError):
+            syndctl.ps_decode(bomb)
+
+    def test_wide_map_rejected(self):
+        blob = bytearray(b"\x42")
+        for i in range(syndctl.MAX_PS_ITEMS + 1):
+            blob += syndctl.ps_encode(f"k{i}") + syndctl.ps_encode(1)
+        blob += b"\x40"
+        with self.assertRaises(ValueError):
+            syndctl.ps_decode(bytes(blob))
+
+    def test_confined_rejects_escapes(self):
+        import os
+        root = syndctl.DRIVE_ROOT
+        fb = os.path.join(root, "daemon.sock")
+        self.assertEqual(syndctl.confined("/etc/passwd", fb), fb)
+        self.assertEqual(syndctl.confined(root + "/../outside", fb), fb)
+        self.assertEqual(syndctl.confined(None, fb), fb)
+        inside = os.path.join(root, "log", "daemon.log")
+        self.assertEqual(syndctl.confined(inside, fb), os.path.realpath(inside))
+
+    def test_field_cap(self):
+        self.assertEqual(len(syndctl._s("x" * 10000)), syndctl._FIELD)
+        self.assertIsNone(syndctl._s(None))
+
 
 class Helpers(unittest.TestCase):
     def test_history_action_names(self):

@@ -76,17 +76,29 @@ Panel {
 
   readonly property string pluginDir: Qt.resolvedUrl(".").toString().replace("file://", "")
 
-  // A stalled command must not wedge polling. Any Process still running when
-  // this fires is cancelled, so the next poll starts clean.
+  // Per-invocation deadline: each Process records when it started, and any
+  // one still running past its budget is cancelled so the next poll starts
+  // clean. The backends carry their own SIGALRM backstop and kill their
+  // child process groups TERM-then-KILL, so cancelling here never strands a
+  // grandchild.
   property int watchdogSeconds: 10
+  property double statusStartedAt: 0
+  property double actionStartedAt: 0
   Timer {
-    interval: root.watchdogSeconds * 1000
+    interval: 2000
     repeat: true
-    running: true
+    running: statusProc.running || actionProc.running
     onTriggered: {
-      if (statusProc.running) statusProc.running = false
-      if (actionProc.running) actionProc.running = false
+      var now = Date.now()
+      if (statusProc.running && now - root.statusStartedAt > root.watchdogSeconds * 1000)
+        statusProc.running = false
+      if (actionProc.running && now - root.actionStartedAt > root.watchdogSeconds * 1000)
+        actionProc.running = false
     }
+  }
+  Component.onDestruction: {
+    statusProc.running = false
+    actionProc.running = false
   }
 
 
@@ -202,9 +214,13 @@ Panel {
   Process {
     id: statusProc
     command: [root.pluginDir + "bin/syndstatus"]
+    onRunningChanged: if (running) root.statusStartedAt = Date.now()
     stdout: StdioCollector {
       onStreamFinished: {
         var out = String(this.text).trim()
+        // The probe caps its own output; treat anything oversized as a
+        // failed poll rather than parsing it.
+        if (out.length > 524288) { root.stale = true; return }
         if (out === "") { root.devicePresent = false; return }
         try {
           var d = JSON.parse(out)
@@ -254,6 +270,7 @@ Panel {
 
   Process {
     id: actionProc
+    onRunningChanged: if (running) root.actionStartedAt = Date.now()
     onExited: { root.busy = false; root.refresh() }
   }
 

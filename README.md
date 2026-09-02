@@ -14,8 +14,9 @@ credentials, and no traffic to the NAS.
 
 ## Before you start
 
-The plugin is a front-end. It needs the official Synology Drive Client
-installed, linked to your NAS, and running.
+The plugin is a front-end and needs manual setup first: the official
+Synology Drive Client must be installed, linked to your NAS, and running.
+The plugin never installs anything itself.
 
 1. Install the client from the AUR:
 

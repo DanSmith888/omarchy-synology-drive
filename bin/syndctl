@@ -32,6 +32,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import sqlite3
 import struct
@@ -55,47 +56,104 @@ _TOOL = "syndctl"
 _STATE_DIR = os.path.join(_RUNTIME_DIR, "dansmith888.synology-drive")
 LOCK_PATH = os.path.join(_STATE_DIR, "lock")
 
-def state_dir():
-    """Our private runtime directory, verified before use.
+def state_dirfd():
+    """An O_DIRECTORY descriptor for our private runtime directory.
 
-    Creating it is not enough: check with lstat that what is there is a real
-    directory we own, not a symlink pointing somewhere else, and that nobody
-    else can write to it.
+    The directory is validated on the descriptor itself (fstat: owned by us,
+    0700), and the lock is then opened *relative to that descriptor*, so
+    replacing a parent between validation and open cannot redirect it.
     """
     try:
         os.makedirs(_STATE_DIR, mode=0o700, exist_ok=True)
     except OSError as exc:
         raise SystemExit(f"{_TOOL}: cannot create {_STATE_DIR}: {exc}")
     try:
-        st = os.lstat(_STATE_DIR)
+        fd = os.open(_STATE_DIR, os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError as exc:
-        raise SystemExit(f"{_TOOL}: cannot stat {_STATE_DIR}: {exc}")
-    if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
-        raise SystemExit(f"{_TOOL}: {_STATE_DIR} is not a directory")
+        raise SystemExit(f"{_TOOL}: cannot open {_STATE_DIR}: {exc}")
+    st = os.fstat(fd)
     if st.st_uid != os.getuid():
+        os.close(fd)
         raise SystemExit(f"{_TOOL}: {_STATE_DIR} is not owned by this user")
     if st.st_mode & 0o077:
-        os.chmod(_STATE_DIR, 0o700)
-    return _STATE_DIR
+        os.fchmod(fd, 0o700)
+    return fd
 
 
-def open_nofollow(path, flags, mode=0o600):
-    """Open without following a final symlink, and only if it is a regular file."""
-    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+LOCK_TIMEOUT = 8.0
+TIMEOUT = 10
+SELF_DEADLINE = 25          # SIGALRM: no invocation may outlive this
+
+DRIVE_DIR = os.path.expanduser("~/.SynologyDrive")
+# Every Synology-controlled path (client.conf can redirect db/log/socket
+# paths) is accepted only after resolving inside this root; anything else
+# falls back to the default location. The client's files are readable by
+# design; the bound stops a rewritten client.conf from pointing this tool at
+# arbitrary files, FIFOs or symlink targets outside the client's own tree.
+DRIVE_ROOT = os.path.realpath(DRIVE_DIR)
+CLIENT_CONF = os.path.join(DRIVE_DIR, "data", "config", "client.conf")
+LAUNCHER = "synology-drive"
+
+MAX_TEXT_BYTES = 256 * 1024      # any single confined text read
+MAX_DB_BYTES = 1 << 30           # sanity ceiling on a database file
+MAX_IPC_REPLY = 64 * 1024        # daemon replies are ~tens of bytes
+MAX_IPC_OBJECTS = 16
+MAX_PS_DEPTH = 16
+MAX_PS_ITEMS = 4096
+MAX_RUN_OUTPUT = 64 * 1024
+MAX_ROWS = 64                    # producer cardinality cap per table read
+_FIELD = 2048                    # per-string cap before the shell model
+
+
+def _s(value, cap=_FIELD):
+    """Truncate any producer-supplied string before it enters the model."""
+    return None if value is None else str(value)[:cap]
+
+
+def confined(path, fallback):
+    """`path` resolved inside DRIVE_ROOT, else the (in-root) fallback."""
+    if path:
+        real = os.path.realpath(path)
+        try:
+            if os.path.commonpath([real, DRIVE_ROOT]) == DRIVE_ROOT:
+                return real
+        except ValueError:
+            pass
+    return os.path.realpath(fallback)
+
+
+def open_confined(path):
+    """O_NOFOLLOW descriptor for a regular file we own, already confined."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
             raise OSError(f"{path} is not a regular file")
+        if st.st_uid != os.getuid():
+            raise OSError(f"{path} is not owned by this user")
     except Exception:
         os.close(fd)
         raise
     return fd
 
-LOCK_TIMEOUT = 30.0
-TIMEOUT = 10
 
-DRIVE_DIR = os.path.expanduser("~/.SynologyDrive")
-CLIENT_CONF = os.path.join(DRIVE_DIR, "data", "config", "client.conf")
-LAUNCHER = "synology-drive"
+def read_confined(path, cap=MAX_TEXT_BYTES):
+    """At most `cap` bytes of a confined regular file, b"" on any failure."""
+    try:
+        fd = open_confined(path)
+    except OSError:
+        return b""
+    try:
+        chunks, total = [], 0
+        while total <= cap:
+            chunk = os.read(fd, min(65536, cap + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        return b"".join(chunks)[:cap]
+    finally:
+        os.close(fd)
 
 # How much of the daemon log one poll reads. The log rotates at 5 MB and is
 # dominated by rescan chatter; 1 MB is ~13k lines, minutes to hours of
@@ -122,12 +180,37 @@ FILTERED_REASONS = {-8192}
 
 
 def _run(cmd, timeout=TIMEOUT, env=None):
-    """(rc, stdout, stderr); rc -1 on timeout/missing binary. Never raises."""
+    """(rc, stdout, stderr); rc -1 on timeout/missing binary. Never raises.
+
+    The child gets its own session so a timeout kills the whole process
+    group (TERM, then KILL); captured output is capped.
+    """
+    proc = None
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, env=env)
-        return r.returncode, r.stdout, r.stderr
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, env=env,
+                                start_new_session=True)
+        try:
+            out, err = proc.communicate(timeout=timeout)
+            rc = proc.returncode
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.wait(timeout=1)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=1)
+            return -1, "", "timeout"
+        return rc, (out or "")[:MAX_RUN_OUTPUT], (err or "")[:MAX_RUN_OUTPUT]
     except Exception as exc:
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                pass
         return -1, "", str(exc)
 
 
@@ -135,17 +218,16 @@ def _run(cmd, timeout=TIMEOUT, env=None):
 # Where the client keeps things
 
 def read_conf():
-    """client.conf as a dict. Empty when the client is not installed."""
+    """client.conf as a dict. Empty when the client is not installed.
+
+    Read bounded and without following symlinks; the path values inside are
+    only ever used after `confined()` maps them back under DRIVE_ROOT.
+    """
     conf = {}
-    try:
-        with open(CLIENT_CONF) as f:
-            for line in f:
-                if "=" not in line:
-                    continue
-                k, v = line.rstrip("\n").split("=", 1)
-                conf[k.strip()] = v.strip().strip('"')
-    except OSError:
-        pass
+    for line in read_confined(CLIENT_CONF).decode("utf-8", "replace").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            conf[k.strip()[:128]] = v.strip().strip('"')[:1024]
     return conf
 
 
@@ -174,12 +256,11 @@ def _proc_running(needle):
 
 def daemon_pid(conf):
     """PID from the daemon's pid file if that process is still the daemon."""
-    pid_file = conf.get("pid_file_path") or os.path.join(DRIVE_DIR, "daemon.pid")
+    pid_file = confined(conf.get("pid_file_path"), os.path.join(DRIVE_DIR, "daemon.pid"))
     try:
-        with open(pid_file) as f:
-            pid = int(f.read().strip() or 0)
+        pid = int(read_confined(pid_file, 64).decode("ascii", "replace").strip() or 0)
         with open(f"/proc/{pid}/cmdline", "rb") as f:
-            if b"cloud-drive-daemon" in f.read():
+            if b"cloud-drive-daemon" in f.read(4096):
                 return pid
     except (OSError, ValueError):
         pass
@@ -203,21 +284,18 @@ def tray_status(ui_pid):
     if len(parts) < 2:
         return None
     text = parts[1].encode().decode("unicode_escape", "ignore")
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    lines = [l.strip()[:128] for l in text.split("\n") if l.strip()]
     return lines[-1] if len(lines) > 1 else (lines[0] if lines else None)
 
 
 def client_version():
     """'4.0.3-17892' from the app bundle's INFO file, else None."""
     parts = {}
-    try:
-        with open(os.path.join(DRIVE_DIR, "SynologyDrive.app", "INFO")) as f:
-            for line in f:
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    parts[k.strip()] = v.strip().strip('"')
-    except OSError:
-        return None
+    text = read_confined(os.path.join(DRIVE_DIR, "SynologyDrive.app", "INFO"), 65536)
+    for line in text.decode("utf-8", "replace").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            parts[k.strip()] = v.strip().strip('"')[:64]
     try:
         ver = ".".join(parts[k] for k in ("major_version", "minor_version", "mini_version"))
     except KeyError:
@@ -229,27 +307,51 @@ def client_version():
 # SQLite: connection + sync folders (sys.sqlite), history (history.sqlite)
 
 def _db(path):
-    """Read-only connection, or None. mode=ro keeps sqlite from ever writing
-    to the client's database; the -shm/-wal files are ours to read."""
-    if not path or not os.path.isfile(path):
+    """Read-only connection to a confined, validated database, or None.
+
+    The file is first opened O_NOFOLLOW and checked (regular, ours, sane
+    size); sqlite then opens the same *name* with mode=ro, and the name is
+    re-checked against the validated descriptor's (dev, inode) so it still
+    binds to what was inspected. WAL/SHM sidecars are derived from that name
+    and therefore stay inside DRIVE_ROOT with it; a descriptor-only open is
+    not possible for a live WAL database.
+    """
+    if not path:
         return None
     try:
+        fd = open_confined(path)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if st.st_size > MAX_DB_BYTES:
+            return None
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+        try:
+            now = os.stat(path)
+            if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+                con.close()
+                return None
+        except OSError:
+            con.close()
+            return None
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA query_only = 1")
         return con
     except sqlite3.Error:
         return None
+    finally:
+        os.close(fd)
 
 
 def _sys_db(conf):
-    return _db(os.path.join(conf.get("db_path") or os.path.join(DRIVE_DIR, "data", "db"),
-                            "sys.sqlite"))
+    base = confined(conf.get("db_path"), os.path.join(DRIVE_DIR, "data", "db"))
+    return _db(confined(os.path.join(base, "sys.sqlite"), os.path.join(DRIVE_DIR, "data", "db", "sys.sqlite")))
 
 
 def _history_db(conf):
-    return _db(conf.get("history_db_path")
-               or os.path.join(DRIVE_DIR, "data", "db", "history.sqlite"))
+    return _db(confined(conf.get("history_db_path"),
+                        os.path.join(DRIVE_DIR, "data", "db", "history.sqlite")))
 
 
 def connection(conf):
@@ -269,16 +371,16 @@ def connection(conf):
         con.close()
     if row is None:
         return None
-    server = row["server_name"] or row["server_ip"] or ""
-    host = row["host_name"] or server.split(".")[0]
+    server = _s(row["server_name"], 256) or _s(row["server_ip"], 64) or ""
+    host = _s(row["host_name"], 128) or server.split(".")[0]
     return {
         "id": row["id"],
         "server": server,
         "host": host,
         "ip": row["server_ip"] or None,
         "port": row["server_port"],
-        "user": row["username"],
-        "computer": row["computer_name"],
+        "user": _s(row["username"], 128),
+        "computer": _s(row["computer_name"], 128),
         "ssl": bool(row["use_ssl"]),
         "linked": bool(row["linked"]),
         "status": row["status"],
@@ -298,19 +400,19 @@ def sessions(conf):
             "select id, conn_id, share_name, remote_path, sync_folder, status, "
             "error, sync_direction, is_read_only, is_daemon_enable, "
             "session_type, custom_session_name, is_shared_with_me "
-            "from session_table order by id").fetchall()
+            "from session_table order by id limit ?", (MAX_ROWS,)).fetchall()
     except sqlite3.Error:
         return []
     finally:
         con.close()
     out = []
     for r in rows:
-        folder = (r["sync_folder"] or "").rstrip("/")
+        folder = _s((r["sync_folder"] or "").rstrip("/"), 1024)
         out.append({
             "id": r["id"],
-            "name": r["custom_session_name"] or r["share_name"] or os.path.basename(folder),
-            "share": r["share_name"],
-            "remote": r["remote_path"] or "/",
+            "name": _s(r["custom_session_name"] or r["share_name"] or os.path.basename(folder), 128),
+            "share": _s(r["share_name"], 128),
+            "remote": _s(r["remote_path"], 512) or "/",
             "folder": folder,
             "status": r["status"],
             "error": r["error"],
@@ -326,7 +428,7 @@ def sessions(conf):
 
 def _history_row(r):
     action = HISTORY_ACTION.get(r["action"], "changed")
-    path = r["path"] or ""
+    path = _s(r["path"], 2048) or ""
     return {
         "exists": bool(path) and os.path.lexists(path),
         "id": r["id"],
@@ -335,9 +437,9 @@ def _history_row(r):
         "action_code": r["action"],
         "time": r["update_time"],
         "is_dir": bool(r["is_dir"]),
-        "name": r["name"],
-        "path": r["path"],
-        "folder": (r["sync_folder"] or "").rstrip("/"),
+        "name": _s(r["name"], 256),
+        "path": path,
+        "folder": _s((r["sync_folder"] or "").rstrip("/"), 1024),
     }
 
 
@@ -396,23 +498,28 @@ def unsynced(conf, limit=8):
 
 
 def _filter_file(path):
-    """A Synology .filter file (INI-ish) as {section: {key: [values]}}."""
+    """A Synology .filter file (INI-ish) as {section: {key: [values]}}.
+
+    Confined bounded read; sections, keys and values are capped before they
+    reach the model.
+    """
     out, section = {}, None
-    try:
-        with open(path) as f:
-            for raw in f:
-                line = raw.strip()
-                if not line:
-                    continue
-                if line.startswith("[") and line.endswith("]"):
-                    section = line[1:-1]
-                    out.setdefault(section, {})
-                elif "=" in line and section is not None:
-                    k, v = line.split("=", 1)
-                    vals = [x.strip().strip('"') for x in v.split(",")]
-                    out[section][k.strip()] = [x for x in vals if x != ""]
-    except OSError:
+    text = read_confined(confined(path, path if str(path).startswith(DRIVE_ROOT) else DRIVE_ROOT), 65536)
+    if not text:
         return None
+    for raw in text.decode("utf-8", "replace").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            if len(out) >= 16:
+                break
+            section = line[1:-1][:64]
+            out.setdefault(section, {})
+        elif "=" in line and section is not None:
+            k, v = line.split("=", 1)
+            vals = [x.strip().strip('"')[:128] for x in v.split(",")[:32]]
+            out[section][k.strip()[:64]] = [x for x in vals if x != ""]
     return out
 
 
@@ -427,7 +534,8 @@ def settings(conf):
     glob = {}
     if con is not None:
         try:
-            glob = {r["key"]: r["value"] for r in con.execute("select key, value from system_table")}
+            glob = {_s(r["key"], 64): _s(r["value"], 256)
+                    for r in con.execute("select key, value from system_table limit 128")}
         except sqlite3.Error:
             glob = {}
         finally:
@@ -524,8 +632,12 @@ def ps_encode(obj, buf=None):
     return bytes(b)
 
 
-def ps_decode(buf, i=0):
-    """(object, next_index). Raises ValueError on an unknown tag."""
+def ps_decode(buf, i=0, depth=0):
+    """(object, next_index). Raises ValueError on an unknown tag, on nesting
+    deeper than MAX_PS_DEPTH, or on a container larger than MAX_PS_ITEMS —
+    the replies this tool asks for are single flat maps of a few keys."""
+    if depth > MAX_PS_DEPTH:
+        raise ValueError("PStream: nesting too deep")
     tag = buf[i]
     if tag == _PS_NULL:
         return None, i + 2
@@ -537,20 +649,26 @@ def ps_decode(buf, i=0):
         return buf[i + 3:i + 3 + n].decode("utf-8", "replace"), i + 3 + n
     if tag == _PS_BIN:
         n = struct.unpack(">I", buf[i + 1:i + 5])[0]
+        if n > len(buf):
+            raise ValueError("PStream: binary length exceeds buffer")
         return buf[i + 5:i + 5 + n], i + 5 + n
     if tag == _PS_ARR:
         i += 1
         out = []
         while buf[i] != _PS_END:
-            v, i = ps_decode(buf, i)
+            if len(out) >= MAX_PS_ITEMS:
+                raise ValueError("PStream: array too large")
+            v, i = ps_decode(buf, i, depth + 1)
             out.append(v)
         return out, i + 1
     if tag == _PS_MAP:
         i += 1
         out = {}
         while buf[i] != _PS_END:
-            k, i = ps_decode(buf, i)
-            v, i = ps_decode(buf, i)
+            if len(out) >= MAX_PS_ITEMS:
+                raise ValueError("PStream: map too large")
+            k, i = ps_decode(buf, i, depth + 1)
+            v, i = ps_decode(buf, i, depth + 1)
             out[k] = v
         return out, i + 1
     raise ValueError(f"PStream: unknown tag 0x{tag:02x} at offset {i}")
@@ -560,17 +678,24 @@ def daemon_call(conf, request, timeout=IPC_TIMEOUT):
     """Send one request map to the daemon, return the list of reply objects.
 
     None when the socket is absent or refuses (daemon not running). The
-    daemon closes the connection after replying, so read to EOF.
+    socket path is confined to DRIVE_ROOT and must be a socket we own; the
+    reply is capped at MAX_IPC_REPLY bytes and MAX_IPC_OBJECTS objects.
     """
-    path = conf.get("socket_path") or os.path.join(DRIVE_DIR, "daemon.sock")
+    path = confined(conf.get("socket_path"), os.path.join(DRIVE_DIR, "daemon.sock"))
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+            return None
+    except OSError:
+        return None
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)
+    data = b""
     try:
         sock.connect(path)
         sock.sendall(ps_encode(request))
-        data = b""
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and len(data) <= MAX_IPC_REPLY:
             try:
                 chunk = sock.recv(65536)
             except socket.timeout:
@@ -582,13 +707,15 @@ def daemon_call(conf, request, timeout=IPC_TIMEOUT):
         return None
     finally:
         sock.close()
+    if len(data) > MAX_IPC_REPLY:
+        return None
     out, i = [], 0
     try:
-        while i < len(data):
+        while i < len(data) and len(out) < MAX_IPC_OBJECTS:
             obj, i = ps_decode(data, i)
             out.append(obj)
     except (ValueError, IndexError, struct.error):
-        out.append({"_undecoded": data[i:].hex()})
+        out.append({"_undecoded": data[i:i + 256].hex()})
     return out
 
 
@@ -628,18 +755,29 @@ _EVENT_KIND = {
 
 
 def _log_path(conf):
-    return conf.get("log_file_path") or os.path.join(DRIVE_DIR, "log", "daemon.log")
+    return confined(conf.get("log_file_path"), os.path.join(DRIVE_DIR, "log", "daemon.log"))
 
 
 def _tail(path, nbytes):
+    """The last `nbytes` of a confined regular file, without following a
+    symlink and never reading more than asked."""
     try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - nbytes))
-            data = f.read()
+        fd = open_confined(path)
     except OSError:
         return b""
+    try:
+        size = os.lseek(fd, 0, os.SEEK_END)
+        os.lseek(fd, max(0, size - nbytes), os.SEEK_SET)
+        chunks, total = [], 0
+        while total < nbytes:
+            chunk = os.read(fd, min(65536, nbytes - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        data = b"".join(chunks)
+    finally:
+        os.close(fd)
     if size > nbytes:
         data = data.split(b"\n", 1)[-1]      # drop the partial first line
     return data
@@ -652,7 +790,13 @@ def log_tail(conf):
     path = _log_path(conf)
     data = _tail(path, LOG_TAIL_BYTES)
     if len(data) < LOG_TAIL_BYTES:
-        rotated = sorted(glob.glob(path + "_*"), key=lambda p: os.path.getmtime(p))
+        def _mtime(p):
+            try:
+                st = os.lstat(p)
+                return st.st_mtime if stat.S_ISREG(st.st_mode) else 0
+            except OSError:
+                return 0
+        rotated = sorted(glob.glob(path + "_*")[:64], key=_mtime)
         if rotated:
             data = _tail(rotated[-1], LOG_TAIL_BYTES - len(data)) + data
     return data.decode("utf-8", "replace")
@@ -808,11 +952,20 @@ class Client:
     """
 
     def __enter__(self):
-        state_dir()
-        # O_RDWR|O_CREAT, never O_TRUNC: the lock file's contents are
-        # irrelevant, and truncating whatever is at the path is the bug.
-        self._lock = os.fdopen(
-            open_nofollow(LOCK_PATH, os.O_RDWR | os.O_CREAT), "r+")
+        # The lock is opened relative to the validated directory descriptor
+        # (never through the full path), O_RDWR|O_CREAT and never O_TRUNC:
+        # the file's contents are irrelevant, and truncating or following
+        # whatever else might sit at the path is the bug being avoided.
+        dirfd = state_dirfd()
+        try:
+            fd = os.open("lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o600, dir_fd=dirfd)
+        finally:
+            os.close(dirfd)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise SystemExit(f"syndctl: {LOCK_PATH} is not a regular file")
+        self._lock = os.fdopen(fd, "r+")
         deadline = time.monotonic() + LOCK_TIMEOUT
         while True:
             try:
@@ -1210,6 +1363,9 @@ def _print_get(st):
 
 
 def main():
+    # Hard backstop: no invocation may outlive this, whatever wedges. The
+    # widget's own deadline is shorter; this catches everything else.
+    signal.alarm(SELF_DEADLINE)
     # SUPPRESS matters: without it the subparser re-declares these flags with
     # their own defaults and clobbers the top-level values, so `--json` only
     # works on one side of the subcommand.
