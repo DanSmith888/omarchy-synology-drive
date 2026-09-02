@@ -221,7 +221,12 @@ Panel {
         // The probe caps its own output; treat anything oversized as a
         // failed poll rather than parsing it.
         if (out.length > 524288) { root.stale = true; return }
-        if (out === "") { root.devicePresent = false; return }
+        // Empty output means the read failed or was cancelled, not that the
+        // client went away: keep the last reading and mark it stale rather
+        // than pulling the pill out of the bar. A real "{}" from the probe
+        // means the client is genuinely not installed and still hides it.
+        if (out === "") { root.stale = root.devicePresent; return }
+        if (out === "{}") { root.devicePresent = false; return }
         try {
           var d = JSON.parse(out)
           root.devicePresent = d.present === true

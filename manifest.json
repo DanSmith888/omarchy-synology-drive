@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "dansmith888.synology-drive",
   "name": "Synology Drive Control",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "author": "Daniel Smith",
   "license": "MIT",
-  "description": "Synology Drive Client status in the bar: what's syncing, what failed, pause/resume — without the Qt tray icon.",
+  "description": "Synology Drive Client status in the bar: what's syncing, what failed, pause/resume \u2014 without the Qt tray icon.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Synology Drive Control",
-    "description": "Synology Drive Client status in the bar: what's syncing, what failed, pause/resume — without the Qt tray icon.",
+    "description": "Synology Drive Client status in the bar: what's syncing, what failed, pause/resume \u2014 without the Qt tray icon.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",
