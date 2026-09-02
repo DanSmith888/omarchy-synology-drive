@@ -49,11 +49,14 @@ def _child_setup(parent_pid):
     it is not used here.
     """
     os.setsid()
+    # Both protections are mandatory: without them the group cannot be
+    # reaped safely, so failing to establish either means not running at all.
     try:
-        ctypes.CDLL("libc.so.6", use_errno=True).prctl(
-            PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+        if ctypes.CDLL("libc.so.6", use_errno=True).prctl(
+                PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+            os._exit(1)
     except Exception:
-        pass
+        os._exit(1)
     # Parent-death race: if the parent died before prctl armed, nothing will
     # ever signal us, so leave now rather than linger as an orphan.
     if os.getppid() != parent_pid:
@@ -68,6 +71,28 @@ def _group_alive(pgid):
         return False
 
 
+def _start_time(pid):
+    """The kernel's start-time ticks for `pid`, or None. Together with the
+    pid this identifies one specific process incarnation: a reused pid gets
+    a different start time."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            data = handle.read(4096)
+        return data.rsplit(b") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def remember_identity(proc):
+    """Record the child leader's (pidfd, start time) right after spawn, so a
+    later reap can prove the pgid still names our child before signalling."""
+    try:
+        proc._pr_pidfd = os.pidfd_open(proc.pid)
+    except OSError:
+        proc._pr_pidfd = None
+    proc._pr_start = _start_time(proc.pid)
+
+
 def reap(proc, grace=KILL_GRACE):
     """Signal the child's whole group and return only once the group is gone.
 
@@ -79,13 +104,23 @@ def reap(proc, grace=KILL_GRACE):
     for sig in (signal.SIGTERM, signal.SIGKILL):
         if not _group_alive(pgid) and proc.poll() is not None:
             break
-        try:
-            os.killpg(pgid, sig)
-        except OSError:
+        # Never signal a numeric pgid blind: after the leader is reaped the
+        # id can be reused by an unrelated process. killpg only while the
+        # leader's recorded start time still matches; once it does not, fall
+        # back to the leader's pidfd (race-free by construction) and stop
+        # touching the group id.
+        if (proc.poll() is None
+                and getattr(proc, "_pr_start", None) is not None
+                and _start_time(proc.pid) == proc._pr_start):
             try:
-                proc.send_signal(sig)
+                os.killpg(pgid, sig)
             except OSError:
                 pass
+        elif proc.poll() is None and getattr(proc, "_pr_pidfd", None) is not None:
+            with contextlib.suppress(OSError):
+                signal.pidfd_send_signal(proc._pr_pidfd, sig)
+        else:
+            break
         try:
             proc.wait(timeout=grace)
         except subprocess.TimeoutExpired:
@@ -95,6 +130,11 @@ def reap(proc, grace=KILL_GRACE):
     if proc.poll() is None:
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=grace)
+    fd = getattr(proc, "_pr_pidfd", None)
+    if fd is not None:
+        proc._pr_pidfd = None
+        with contextlib.suppress(OSError):
+            os.close(fd)
     _ACTIVE.discard(proc)
 
 
@@ -214,6 +254,7 @@ def run_bounded(cmd, timeout=6, max_output=MAX_OUTPUT, env=None):
         return 1, "", str(exc)
     finally:
         os.close(exe_fd)
+    remember_identity(proc)
     _ACTIVE.add(proc)
 
     bufs = {proc.stdout: bytearray(), proc.stderr: bytearray()}

@@ -13,10 +13,11 @@ All the work is in bin/syndctl; this only decides whether there is anything
 to show. Standard library only. No root, no network.
 """
 
-import importlib.machinery
-import importlib.util
 import json
 import os
+import stat
+import types
+import shutil
 import re
 import signal
 import sys
@@ -29,15 +30,34 @@ sys.dont_write_bytecode = True
 
 
 def _runtime():
-    """Load bin/plugin_runtime.py by path, not by sys.path search.
+    """Execute bin/plugin_runtime.py from bytes read through a validated
+    no-follow descriptor.
 
-    An entry earlier on sys.path could otherwise shadow the module name.
+    SourceFileLoader could satisfy the import from a matching
+    __pycache__/*.pyc, executing bytecode nobody reviewed instead of the
+    source next to it. Reading the exact bytes and compiling them leaves no
+    bytecode path at all; a __pycache__ next to us is stale build litter and
+    is removed so it cannot shadow anything else either.
     """
+    shutil.rmtree(os.path.join(HERE, "__pycache__"), ignore_errors=True)
     path = os.path.join(HERE, "plugin_runtime.py")
-    loader = importlib.machinery.SourceFileLoader("plugin_runtime", path)
-    spec = importlib.util.spec_from_loader("plugin_runtime", loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise SystemExit(f"syndstatus: cannot open {path}: {exc}")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() \
+                or st.st_size > 1_000_000:
+            raise SystemExit(f"syndstatus: {path} failed validation")
+        with os.fdopen(fd, "rb") as handle:
+            source = handle.read(st.st_size)
+    except OSError as exc:
+        raise SystemExit(f"syndstatus: cannot read {path}: {exc}")
+    mod = types.ModuleType("plugin_runtime")
+    mod.__file__ = path
+    sys.modules["plugin_runtime"] = mod
+    exec(compile(source, path, "exec"), mod.__dict__)
     return mod
 
 

@@ -27,11 +27,12 @@ the same request the client's own Pause button sends — not the launcher's
 
 import argparse
 import fcntl
-import importlib.machinery
-import importlib.util
 import glob
 import json
+import contextlib
 import os
+import types
+import shutil
 import re
 import signal
 import socket
@@ -89,15 +90,34 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _runtime():
-    """Load bin/plugin_runtime.py by path, not by sys.path search.
+    """Execute bin/plugin_runtime.py from bytes read through a validated
+    no-follow descriptor.
 
-    An entry earlier on sys.path could otherwise shadow the module name.
+    SourceFileLoader could satisfy the import from a matching
+    __pycache__/*.pyc, executing bytecode nobody reviewed instead of the
+    source next to it. Reading the exact bytes and compiling them leaves no
+    bytecode path at all; a __pycache__ next to us is stale build litter and
+    is removed so it cannot shadow anything else either.
     """
+    shutil.rmtree(os.path.join(_HERE, "__pycache__"), ignore_errors=True)
     path = os.path.join(_HERE, "plugin_runtime.py")
-    loader = importlib.machinery.SourceFileLoader("plugin_runtime", path)
-    spec = importlib.util.spec_from_loader("plugin_runtime", loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise SystemExit(f"syndctl: cannot open {path}: {exc}")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() \
+                or st.st_size > 1_000_000:
+            raise SystemExit(f"syndctl: {path} failed validation")
+        with os.fdopen(fd, "rb") as handle:
+            source = handle.read(st.st_size)
+    except OSError as exc:
+        raise SystemExit(f"syndctl: cannot read {path}: {exc}")
+    mod = types.ModuleType("plugin_runtime")
+    mod.__file__ = path
+    sys.modules["plugin_runtime"] = mod
+    exec(compile(source, path, "exec"), mod.__dict__)
     return mod
 
 
@@ -360,6 +380,37 @@ def client_version():
 # ---------------------------------------------------------------------------
 # SQLite: connection + sync folders (sys.sqlite), history (history.sqlite)
 
+class _BoundConnection:
+    """A sqlite3 connection that owns the validated directory descriptor.
+
+    SQLite opens WAL/SHM sidecars lazily during later queries through the
+    /proc/self/fd/<dir_fd>/ path it was given, so the descriptor must stay
+    alive exactly as long as the connection: it is closed with it, and by
+    the destructor as a backstop.
+    """
+
+    def __init__(self, con, dir_fd):
+        object.__setattr__(self, "_con", con)
+        object.__setattr__(self, "_dir_fd", dir_fd)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_con"), name)
+
+    def close(self):
+        try:
+            object.__getattribute__(self, "_con").close()
+        finally:
+            fd = object.__getattribute__(self, "_dir_fd")
+            if fd is not None:
+                object.__setattr__(self, "_dir_fd", None)
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+
+    def __del__(self):
+        with contextlib.suppress(Exception):
+            self.close()
+
+
 def _db(path):
     """Read-only connection to a confined, validated database, or None.
 
@@ -368,12 +419,12 @@ def _db(path):
     descriptor-only open is not possible for a live database.
 
     So the parent chain is walked on descriptors (walk_confined) and sqlite is
-    pointed at that held directory through /proc/self/fd. The path it opens is
-    rooted in the inode we validated rather than in a name that could have
-    been re-pointed since, and the sidecars land in that same directory. Only
-    the final component is still opened by name, so its (dev, inode) is
-    re-checked against the descriptor we inspected: prevention for the
-    parents, detection for the leaf.
+    pointed at that held directory through /proc/self/fd. The directory
+    descriptor is owned by the returned connection and lives as long as it
+    does, so a sidecar opened lazily mid-query still resolves through the
+    validated object. Only the final component is opened by name, so its
+    (dev, inode) is re-checked against the descriptor we inspected:
+    prevention for the parents, detection for the leaf.
     """
     if not path:
         return None
@@ -390,27 +441,30 @@ def _db(path):
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            os.close(dir_fd)
             return None
         if st.st_size > MAX_DB_BYTES:
+            os.close(dir_fd)
             return None
         bound = os.path.join(f"/proc/self/fd/{dir_fd}", leaf)
-        con = sqlite3.connect(f"file:{bound}?mode=ro", uri=True, timeout=1.0)
+        try:
+            con = sqlite3.connect(f"file:{bound}?mode=ro", uri=True, timeout=1.0)
+        except sqlite3.Error:
+            os.close(dir_fd)
+            return None
         try:
             now = os.stat(bound)
             if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
-                con.close()
-                return None
+                raise OSError("leaf changed under us")
         except OSError:
             con.close()
+            os.close(dir_fd)
             return None
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA query_only = 1")
-        return con
-    except sqlite3.Error:
-        return None
+        return _BoundConnection(con, dir_fd)
     finally:
         os.close(fd)
-        os.close(dir_fd)
 
 
 def _sys_db(conf):
@@ -743,30 +797,42 @@ def ps_decode(buf, i=0, depth=0):
     raise ValueError(f"PStream: unknown tag 0x{tag:02x} at offset {i}")
 
 
-def _peer_is_ours(sock):
-    """True when the process on the other end of `sock` runs as us.
+def _daemon_exe_paths():
+    """Absolute paths the real daemon may run from. The vendor installs the
+    live binary under the user's home (SynologyDrive.app), so root ownership
+    cannot be required of it; identity comes from the exact path plus the
+    kernel-reported pid matching the pid-file-validated daemon."""
+    return (
+        os.path.join(DRIVE_ROOT, "SynologyDrive.app", "bin", "cloud-drive-daemon"),
+        "/opt/Synology/SynologyDrive/package/cloudstation/bin/cloud-drive-daemon",
+    )
 
-    SO_PEERCRED is recorded by the kernel at connect time and cannot be forged
-    by the peer, so it answers "who is actually there" rather than "what did
-    the directory entry look like a moment ago". The uid check is the
-    load-bearing one: a socket planted by another user cannot pass it. The
-    executable name is a secondary check, skipped when /proc does not answer,
-    since a daemon that exited between connect and check should read as "not
-    running" rather than as an attack.
+
+def _peer_is_daemon(sock, expected_pid):
+    """True only when the connected peer is the validated daemon. Fail closed.
+
+    SO_PEERCRED is recorded by the kernel at connect time and cannot be
+    forged. Three bindings, all required: the peer uid is ours, the peer pid
+    is exactly the daemon pid we validated out of the pid file (a same-user
+    process merely *named* cloud-drive-daemon serving a planted socket has a
+    different pid), and /proc/<pid>/exe resolves to one of the daemon's
+    known absolute locations. Any error reads as "not the daemon".
     """
+    if not expected_pid:
+        return False
     try:
         raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
                               struct.calcsize("3i"))
         pid, uid, _gid = struct.unpack("3i", raw)
     except (OSError, struct.error):
         return False
-    if uid != os.getuid():
+    if uid != os.getuid() or pid != expected_pid:
         return False
     try:
-        exe = os.path.basename(os.readlink(f"/proc/{pid}/exe"))
+        exe = os.readlink(f"/proc/{pid}/exe")
     except OSError:
-        return True
-    return exe in (DAEMON_PROCESS, LAUNCHER)
+        return False
+    return exe in _daemon_exe_paths()
 
 
 def daemon_call(conf, request, timeout=IPC_TIMEOUT):
@@ -783,6 +849,9 @@ def daemon_call(conf, request, timeout=IPC_TIMEOUT):
 
     The reply is capped at MAX_IPC_REPLY bytes and MAX_IPC_OBJECTS objects.
     """
+    expected_pid = daemon_pid(conf)
+    if not expected_pid:
+        return None
     path = confined(conf.get("socket_path"), os.path.join(DRIVE_DIR, "daemon.sock"))
     try:
         dir_fd, leaf = walk_confined(path)
@@ -800,7 +869,7 @@ def daemon_call(conf, request, timeout=IPC_TIMEOUT):
         sock.settimeout(timeout)
         try:
             sock.connect(os.path.join(f"/proc/self/fd/{dir_fd}", leaf))
-            if not _peer_is_ours(sock):
+            if not _peer_is_daemon(sock, expected_pid):
                 return None
             sock.sendall(ps_encode(request))
             deadline = time.monotonic() + timeout
