@@ -65,7 +65,7 @@ Panel {
 
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
-  readonly property color dim: Qt.darker(root.barForeground, 1.4)
+  readonly property color dim: Qt.darker(Color.popups.text, 1.4)
   readonly property color urgent: root.bar ? root.bar.urgent : Color.urgent
   readonly property int logCount: {
     var n = root.settings && typeof root.settings.logCount === "number" ? root.settings.logCount : 40
@@ -333,7 +333,7 @@ Panel {
     Rectangle {
       anchors.fill: parent
       radius: Style.cornerRadius
-      color: root.barForeground
+      color: Color.popups.text
       opacity: rowMouse.containsMouse && row.clickable ? 0.08 : 0
     }
 
@@ -365,7 +365,7 @@ Panel {
         textFormat: Text.PlainText
         width: parent.width
         text: row.title
-        color: root.barForeground
+        color: Color.popups.text
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
         elide: Text.ElideMiddle
@@ -390,7 +390,7 @@ Panel {
       anchors.verticalCenter: parent.verticalCenter
       iconText: row.actionGlyph
       tooltipText: row.actionTooltip
-      foreground: root.barForeground
+      foreground: Color.popups.text
       fontFamily: root.fontFamily
       fontSize: Style.font.iconSmall
       enabled: !root.busy
@@ -450,7 +450,7 @@ Panel {
       anchors.leftMargin: Style.space(8)
       horizontalAlignment: Text.AlignRight
       text: parent.value
-      color: root.barForeground
+      color: Color.popups.text
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
       elide: Text.ElideLeft
@@ -471,7 +471,7 @@ Panel {
       anchors.left: parent.left
       anchors.verticalCenter: parent.verticalCenter
       text: fold.text
-      foreground: root.barForeground
+      foreground: Color.popups.text
       fontFamily: root.fontFamily
     }
     Text {
@@ -559,14 +559,14 @@ Panel {
               : root.syncState === "uptodate" || root.syncState === "" ? ""
               : root.syncState === "syncing" ? "SYNCING"
               : root.stateText(root.syncState).toUpperCase()
-          foreground: root.barForeground
+          foreground: Color.popups.text
           fontFamily: root.fontFamily
           iconOpacity: root.stale ? 0.5 : 1
           iconComponent: Component {
             Text {
               textFormat: Text.PlainText
               text: root.stateGlyph(root.syncState)
-              color: root.syncState === "error" ? root.urgent : root.barForeground
+              color: root.syncState === "error" ? root.urgent : Color.popups.text
               font.family: root.fontFamily
               font.pixelSize: Style.font.display
             }
@@ -576,7 +576,7 @@ Panel {
               visible: root.canControl
               iconText: root.paused ? "󰐊" : "󰏤"
               tooltipText: root.paused ? "Resume syncing (all tasks)" : "Pause syncing (all tasks)"
-              foreground: root.barForeground
+              foreground: Color.popups.text
               fontFamily: root.fontFamily
               bordered: true
               enabled: !root.busy
@@ -588,7 +588,7 @@ Panel {
         PanelSeparator {
           anchors.left: parent.left
           anchors.right: parent.right
-          foreground: root.barForeground
+          foreground: Color.popups.text
         }
 
         // ---- Something needs saying: paused / offline / stopped.
@@ -614,7 +614,7 @@ Panel {
         // ---- What is moving right now.
         PanelSectionHeader {
           text: "NOW"
-          foreground: root.barForeground
+          foreground: Color.popups.text
           fontFamily: root.fontFamily
           visible: root.current !== null || root.pending > 0
         }
@@ -663,7 +663,7 @@ Panel {
         // ---- Sync folders: click to open in the file manager.
         PanelSectionHeader {
           text: "SYNC FOLDERS"
-          foreground: root.barForeground
+          foreground: Color.popups.text
           fontFamily: root.fontFamily
           visible: root.sessions.length > 0
         }
@@ -691,7 +691,7 @@ Panel {
         // ---- Files the client refused: the thing the old tray nagged about.
         PanelSectionHeader {
           text: "PROBLEMS"
-          foreground: root.barForeground
+          foreground: Color.popups.text
           fontFamily: root.fontFamily
           visible: root.unsynced.length > 0
         }
@@ -722,7 +722,7 @@ Panel {
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
             text: "LOG"
-            foreground: root.barForeground
+            foreground: Color.popups.text
             fontFamily: root.fontFamily
           }
 
@@ -742,7 +742,7 @@ Panel {
                 text: modelData.label
                 bordered: true
                 selected: root.logFilter === modelData.id
-                foreground: root.barForeground
+                foreground: Color.popups.text
                 fontFamily: root.fontFamily
                 fontSize: Style.font.caption
                 horizontalPadding: Style.space(7)
@@ -861,7 +861,7 @@ Panel {
               Text {
                 textFormat: Text.PlainText
                 text: taskRow.modelData.name + " · " + taskRow.modelData.direction + (taskRow.modelData.read_only ? " · read-only" : "")
-                color: root.barForeground
+                color: Color.popups.text
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
@@ -891,7 +891,7 @@ Panel {
         PanelSeparator {
           anchors.left: parent.left
           anchors.right: parent.right
-          foreground: root.barForeground
+          foreground: Color.popups.text
         }
 
         // ---- Footer: the client's own window for anything we don't cover.
@@ -904,7 +904,7 @@ Panel {
             anchors.left: parent.left
             text: root.syncState === "stopped" ? "Start Synology Drive" : "Open Synology Drive"
             bordered: true
-            foreground: root.barForeground
+            foreground: Color.popups.text
             fontFamily: root.fontFamily
             fontSize: Style.font.caption
             enabled: !root.busy
