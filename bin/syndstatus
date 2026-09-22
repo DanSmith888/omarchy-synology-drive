@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """syndstatus — one JSON line describing the Synology Drive Client's state.
 
     {"present": true, "state": "syncing", "pending": 3, "sessions": [...], ...}
